@@ -3,6 +3,9 @@
 Dashboard Streamlit para consultar el Censo Argentino publicado en Source Cooperative
 sin usar el plugin de QGIS.
 
+Autor: Salvador Nicosia <salvalrc@gmail.com>
+Año: 2026
+
 Versión robusta:
 - El selector de variables se arma desde las variables REALES presentes en census-data.parquet.
 - Si una variable común de totales, como POB_TOT_P o VIV_TOT_P, no aparece en la tabla larga,
@@ -46,6 +49,9 @@ st.set_page_config(
     page_icon="🇦🇷",
     layout="wide",
 )
+
+# Autoría del dashboard. Se refleja en el pie de página.
+AUTHOR = "Salvador Nicosia"
 
 VALID_YEARS = [1991, 2001, 2010, 2022]
 BASE_URL = "https://data.source.coop/nlebovits/censo-argentino/{year}/{filename}"
@@ -2484,3 +2490,13 @@ LIMIT 20
             except Exception as exc:
                 st.error("Error ejecutando SQL.")
                 st.exception(exc)
+
+
+# -----------------------------------------------------------------------------
+# Pie de página / autoría
+# -----------------------------------------------------------------------------
+st.divider()
+st.caption(
+    f"Dashboard Censo Argentino · Desarrollado por **{AUTHOR}** · "
+    "Datos: Censo Argentino (Source Cooperative) · Streamlit + DuckDB."
+)

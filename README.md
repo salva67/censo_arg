@@ -1,5 +1,7 @@
 # Dashboard Censo Argentino · Streamlit + DuckDB
 
+> **Autor:** Salvador Nicosia · [salvalrc@gmail.com](mailto:salvalrc@gmail.com)
+
 Dashboard para consultar datos del **Censo Argentino** publicados en Source Cooperative, sin usar QGIS. La app lee archivos Parquet/GeoParquet remotos con DuckDB y permite explorar variables censales, filtrar por geografía, descargar resultados, generar gráficos informativos y visualizar radios censales en mapas con capas.
 
 ## Qué incluye
@@ -95,6 +97,10 @@ No requiere secrets ni credenciales porque consulta datos públicos remotos.
 - Para evitar el error de PyArrow al leer HTTPS desde GeoPandas en Streamlit Cloud, el GeoParquet se descarga primero a `/tmp/censo_argentino_cache` y después se lee localmente.
 - Los nombres de provincias y departamentos se intentan resolver con GeoRef. Si no responde, la app mantiene códigos como fallback.
 - Para `POB_TOT_P` y `VIV_TOT_P`, la app puede consultar directamente `radios.parquet`, porque esas variables están publicadas como columnas geográficas.
+
+## Autor
+
+Proyecto desarrollado por **Salvador Nicosia** ([salvalrc@gmail.com](mailto:salvalrc@gmail.com)).
 
 ## Licencia
 
