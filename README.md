@@ -19,9 +19,12 @@ Dashboard para consultar datos del **Censo Argentino** publicados en Source Coop
 - Mapa de radios censales con capas:
   - polígonos coropléticos,
   - burbujas por centroides,
+  - capa de calor ponderada por valor,
   - etiquetas para top radios,
   - vista 3D,
-  - métrica de color por valor total, valor/km² o log(valor + 1).
+  - métrica de color por valor total, valor/km² o log(valor + 1),
+  - escala continua o por cuantiles,
+  - paletas alternativas, opacidad, bordes y filtros visuales por top/percentil/valor mínimo.
 - Consola SQL avanzada dentro de Streamlit.
 - Script CLI opcional para consultas y exportaciones.
 
@@ -104,3 +107,17 @@ Definir antes de publicar si el repositorio será público. Una opción habitual
 - Deduplica columnas luego de merges y antes de construir capas PyDeck.
 - Evita columnas repetidas cuando la métrica elegida es el mismo campo que el valor (`conteo`).
 - Mantiene el mapa funcionando con coroplético, burbujas, etiquetas y vista 3D.
+
+
+## Cambios v7
+
+- Mejora la pestaña **Mapa y capas** con controles más finos de visualización.
+- Agrega escala de color **continua** o por **cuantiles** para manejar outliers.
+- Agrega paletas alternativas: Azul, Verde, Naranja/Rojo, Violeta y Gris/Azul.
+- Agrega recorte de escala por percentil superior para que un radio extremo no opaque el resto del mapa.
+- Agrega capa de **calor** ponderada por la métrica seleccionada.
+- Agrega filtros visuales de radios: todos, top N, percentil superior o valor mínimo.
+- Agrega límite máximo de radios a renderizar para cuidar performance en Streamlit Cloud.
+- Mejora tooltips con ranking, percentil, área y valor por km².
+- Calcula centroides en CRS proyectado antes de mostrarlos como burbujas/etiquetas.
+- Agrega tabla descargable de radios efectivamente mapeados.

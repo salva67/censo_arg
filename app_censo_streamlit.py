@@ -945,23 +945,112 @@ def load_radios_geoparquet(year: int, provincia_code: str | None, departamento_c
     return gdf
 
 
+
+def _interpolate_rgb(c1: list[int], c2: list[int], t: float) -> list[int]:
+    t = max(0.0, min(1.0, float(t)))
+    return [int(round(c1[i] + (c2[i] - c1[i]) * t)) for i in range(3)]
+
+
+def rgba_to_hex(color: list[int]) -> str:
+    if not color or len(color) < 3:
+        return "#000000"
+    return "#" + "".join(f"{max(0, min(255, int(v))):02x}" for v in color[:3])
+
+
+def palette_color(norm: float, palette: str = "Azul", alpha: int = 165) -> list[int]:
+    """Devuelve colores RGBA para PyDeck sin depender de librerías externas."""
+    palettes = {
+        "Azul": ([232, 244, 255], [82, 151, 220], [7, 59, 138]),
+        "Verde": ([235, 250, 238], [87, 181, 121], [12, 104, 61]),
+        "Naranja/Rojo": ([255, 244, 224], [244, 151, 67], [175, 35, 35]),
+        "Violeta": ([246, 238, 255], [148, 107, 214], [78, 42, 132]),
+        "Gris/Azul": ([238, 241, 245], [116, 151, 182], [34, 66, 94]),
+    }
+    low, mid, high = palettes.get(palette, palettes["Azul"])
+    x = max(0.0, min(1.0, float(norm) if pd.notna(norm) else 0.0))
+    if x <= 0.5:
+        rgb = _interpolate_rgb(low, mid, x * 2)
+    else:
+        rgb = _interpolate_rgb(mid, high, (x - 0.5) * 2)
+    return rgb + [int(alpha)]
+
+
+def compute_norm_series(values: pd.Series, method: str = "Continuo", clip_upper_pct: int = 98) -> pd.Series:
+    """Normaliza valores para color, con opción de percentiles para reducir outliers."""
+    s = pd.to_numeric(values, errors="coerce").fillna(0).astype(float)
+    if s.empty:
+        return s
+
+    if method == "Cuantiles":
+        return s.rank(method="average", pct=True).fillna(0).clip(0, 1)
+
+    upper_pct = max(50, min(100, int(clip_upper_pct)))
+    upper = float(s.quantile(upper_pct / 100)) if len(s) > 1 else float(s.max())
+    lower = float(s.min())
+    if upper <= lower:
+        upper = float(s.max())
+    denom = max(upper - lower, 1.0)
+    return ((s.clip(lower=lower, upper=upper) - lower) / denom).fillna(0).clip(0, 1)
+
+
+def compute_view_state(gdf, extruded: bool = False):
+    """Centra el mapa usando bounds y calcula un zoom aproximado según extensión."""
+    bounds = gdf.total_bounds  # minx, miny, maxx, maxy
+    minx, miny, maxx, maxy = [float(x) for x in bounds]
+    longitude = (minx + maxx) / 2
+    latitude = (miny + maxy) / 2
+    span = max(abs(maxx - minx), abs(maxy - miny), 0.001)
+
+    if span < 0.03:
+        zoom = 12
+    elif span < 0.08:
+        zoom = 11
+    elif span < 0.18:
+        zoom = 10
+    elif span < 0.45:
+        zoom = 9
+    elif span < 1.0:
+        zoom = 8
+    elif span < 2.5:
+        zoom = 7
+    else:
+        zoom = 5.5
+
+    return pdk.ViewState(
+        latitude=latitude,
+        longitude=longitude,
+        zoom=zoom,
+        pitch=45 if extruded else 0,
+        bearing=0,
+    )
+
+
 def build_choropleth_map(
     gdf,
     year: int,
     value_col: str = "conteo",
     simplify_tolerance: float = 0.0002,
     metric_mode: str = "Valor total",
+    color_method: str = "Continuo",
+    color_palette: str = "Azul",
+    clip_upper_pct: int = 98,
+    polygon_opacity: int = 165,
+    border_opacity: int = 100,
+    border_width: float = 0.4,
     show_polygons: bool = True,
     show_bubbles: bool = False,
+    show_heatmap: bool = False,
     show_labels: bool = False,
     label_top_n: int = 20,
+    bubble_scale: float = 1.0,
+    heatmap_radius: int = 45,
     extruded: bool = False,
 ):
     if pdk is None:
         raise RuntimeError("Falta pydeck. Instalá: pip install pydeck")
 
     if gdf.empty:
-        return None, pd.DataFrame()
+        return None, pd.DataFrame(), pd.DataFrame()
 
     gdf = gdf.copy()
     gdf = drop_duplicated_columns_keep_first(gdf)
@@ -995,28 +1084,35 @@ def build_choropleth_map(
     if simplify_tolerance and simplify_tolerance > 0:
         gdf["geometry"] = gdf.geometry.simplify(simplify_tolerance, preserve_topology=True)
 
-    min_val = float(gdf[metric_col].min())
-    max_val = float(gdf[metric_col].max())
-    denom = max(max_val - min_val, 1.0)
-    gdf["_norm"] = ((gdf[metric_col] - min_val) / denom).clip(0, 1)
+    gdf["_norm"] = compute_norm_series(gdf[metric_col], method=color_method, clip_upper_pct=clip_upper_pct)
+    gdf["fill_color"] = gdf["_norm"].apply(lambda x: palette_color(x, color_palette, polygon_opacity))
+    gdf["color_hex"] = gdf["fill_color"].apply(rgba_to_hex)
+    gdf["elevation"] = (gdf["_norm"] * 3500).fillna(0)
+    gdf["ranking_mapa"] = gdf[value_col].rank(method="first", ascending=False).astype(int)
+    gdf["percentil_mapa"] = gdf[value_col].rank(method="average", pct=True).fillna(0)
 
-    gdf["fill_color"] = gdf["_norm"].apply(
-        lambda x: [int(55 + 180 * x), int(120 - 70 * x), int(220 - 120 * x), 150]
-    )
-    gdf["elevation"] = (gdf["_norm"] * 2500).fillna(0)
-
-    centroids = gdf.geometry.centroid
+    # Centroides en CRS proyectado para evitar distorsión y warnings.
+    centroids = gdf.to_crs(3857).geometry.centroid.to_crs(4326)
     gdf["lon"] = centroids.x
     gdf["lat"] = centroids.y
-    gdf["radio_burbuja"] = (80 + 900 * np.sqrt(gdf["_norm"].clip(0, 1))).fillna(80)
+    gdf["radio_burbuja"] = (70 + 1250 * np.sqrt(gdf["_norm"].clip(0, 1)) * float(bubble_scale)).fillna(70)
     gdf["label"] = gdf[value_col].round(0).astype("Int64").astype(str)
-
-    latitude = float(gdf["lat"].mean())
-    longitude = float(gdf["lon"].mean())
 
     join_col = JOIN_COL_BY_YEAR[year]
     export_cols = unique_existing_columns(
-        [join_col, value_col, metric_col, "area_km2", "valor_por_km2", "fill_color", "elevation", "geometry"],
+        [
+            join_col,
+            value_col,
+            metric_col,
+            "ranking_mapa",
+            "percentil_mapa",
+            "area_km2",
+            "valor_por_km2",
+            "color_hex",
+            "fill_color",
+            "elevation",
+            "geometry",
+        ],
         gdf.columns,
     )
     geojson_gdf = gdf[export_cols].copy()
@@ -1037,16 +1133,42 @@ def build_choropleth_map(
                 extruded=extruded,
                 get_fill_color="properties.fill_color",
                 get_elevation="properties.elevation",
-                get_line_color=[80, 80, 80, 80],
-                line_width_min_pixels=0.2,
+                get_line_color=[35, 35, 35, int(border_opacity)],
+                line_width_min_pixels=float(border_width),
             )
         )
 
     point_cols = unique_existing_columns(
-        [join_col, value_col, metric_col, "area_km2", "valor_por_km2", "lon", "lat", "radio_burbuja", "label"],
+        [
+            join_col,
+            value_col,
+            metric_col,
+            "ranking_mapa",
+            "percentil_mapa",
+            "area_km2",
+            "valor_por_km2",
+            "lon",
+            "lat",
+            "radio_burbuja",
+            "label",
+            "color_hex",
+        ],
         gdf.columns,
     )
     points_df = pd.DataFrame(drop_duplicated_columns_keep_first(gdf[point_cols]))
+
+    if show_heatmap:
+        layers.append(
+            pdk.Layer(
+                "HeatmapLayer",
+                points_df,
+                get_position="[lon, lat]",
+                get_weight=metric_col,
+                radius_pixels=int(heatmap_radius),
+                intensity=1,
+                threshold=0.03,
+            )
+        )
 
     if show_bubbles:
         layers.append(
@@ -1056,8 +1178,8 @@ def build_choropleth_map(
                 pickable=True,
                 get_position="[lon, lat]",
                 get_radius="radio_burbuja",
-                get_fill_color=[30, 90, 180, 130],
-                get_line_color=[20, 20, 20, 120],
+                get_fill_color=[30, 90, 180, 115],
+                get_line_color=[20, 20, 20, 130],
                 line_width_min_pixels=1,
             )
         )
@@ -1072,35 +1194,49 @@ def build_choropleth_map(
                 get_position="[lon, lat]",
                 get_text="label",
                 get_size=13,
-                get_color=[20, 20, 20, 230],
+                get_color=[20, 20, 20, 235],
                 get_angle=0,
                 get_text_anchor="middle",
                 get_alignment_baseline="center",
             )
         )
 
-    view_state = pdk.ViewState(
-        latitude=latitude,
-        longitude=longitude,
-        zoom=8 if len(gdf) < 1500 else 6,
-        pitch=35 if extruded else 0,
-    )
+    view_state = compute_view_state(gdf, extruded=extruded)
 
     tooltip = {
         "html": (
             "<b>Radio:</b> {" + join_col + "}<br/>"
             "<b>Valor:</b> {" + value_col + "}<br/>"
+            "<b>Ranking:</b> {ranking_mapa}<br/>"
+            "<b>Percentil:</b> {percentil_mapa}<br/>"
             "<b>Km²:</b> {area_km2}<br/>"
             "<b>Valor/km²:</b> {valor_por_km2}<br/>"
-            f"<b>Capa:</b> {metric_title}"
+            f"<b>Capa:</b> {metric_title}<br/>"
+            f"<b>Escala:</b> {color_method}"
         ),
         "style": {"backgroundColor": "white", "color": "black"},
     }
 
     deck = pdk.Deck(layers=layers, initial_view_state=view_state, tooltip=tooltip)
-    summary_cols = unique_existing_columns([join_col, value_col, "area_km2", "valor_por_km2", "lon", "lat"], gdf.columns)
+    summary_cols = unique_existing_columns(
+        [join_col, value_col, metric_col, "ranking_mapa", "percentil_mapa", "area_km2", "valor_por_km2", "lon", "lat", "color_hex"],
+        gdf.columns,
+    )
     map_summary = pd.DataFrame(drop_duplicated_columns_keep_first(gdf[summary_cols])).copy()
-    return deck, map_summary
+
+    q = pd.to_numeric(gdf[metric_col], errors="coerce").fillna(0)
+    legend_df = pd.DataFrame(
+        {
+            "tramo": ["Bajo", "Medio", "Alto"],
+            "referencia": [float(q.quantile(0.10)), float(q.quantile(0.50)), float(q.quantile(0.90))],
+            "color": [
+                rgba_to_hex(palette_color(0.10, color_palette, polygon_opacity)),
+                rgba_to_hex(palette_color(0.50, color_palette, polygon_opacity)),
+                rgba_to_hex(palette_color(0.90, color_palette, polygon_opacity)),
+            ],
+        }
+    )
+    return deck, map_summary, legend_df
 
 
 # -----------------------------------------------------------------------------
@@ -1337,29 +1473,98 @@ else:
         elif group_selected == "Categoría" and variable_selected in RADIOS_NUMERIC_VARIABLES:
             st.info("Las variables provenientes de radios.parquet no tienen categorías. Cambiá la agrupación para mapear.")
         else:
-            cfg1, cfg2, cfg3 = st.columns(3)
+            with st.expander("Cómo leer las capas", expanded=False):
+                st.write(
+                    "Usá **Valor total** para ver concentración absoluta, **Valor por km²** para una aproximación de densidad "
+                    "y **Log(valor + 1)** cuando un radio muy grande domina la escala. La escala por **cuantiles** reparte los colores "
+                    "de forma más equilibrada cuando hay muchos outliers."
+                )
+
+            cfg1, cfg2, cfg3, cfg4 = st.columns(4)
             with cfg1:
                 metric_mode = st.selectbox(
                     "Métrica de color",
                     ["Valor total", "Valor por km²", "Log(valor + 1)"],
                     index=0,
-                    help="Valor por km² sirve como aproximación de densidad para población/viviendas."
+                    help="Valor por km² sirve como aproximación de densidad para población/viviendas.",
                 )
+                color_method = st.selectbox(
+                    "Escala de color",
+                    ["Continuo", "Cuantiles"],
+                    index=0,
+                    help="Cuantiles mejora la lectura cuando hay outliers fuertes.",
+                )
+            with cfg2:
+                color_palette = st.selectbox(
+                    "Paleta",
+                    ["Azul", "Verde", "Naranja/Rojo", "Violeta", "Gris/Azul"],
+                    index=0,
+                )
+                clip_upper_pct = st.slider(
+                    "Corte superior color",
+                    min_value=80,
+                    max_value=100,
+                    value=98,
+                    step=1,
+                    help="Recorta la escala de color en el percentil elegido para que los outliers no apaguen el mapa.",
+                )
+            with cfg3:
                 simplify_tolerance = st.slider(
                     "Simplificación geométrica",
                     min_value=0.0,
-                    max_value=0.004,
+                    max_value=0.006,
                     value=0.0004,
                     step=0.0001,
                     help="Valores más altos alivian el mapa, pero reducen detalle de polígonos.",
                 )
-            with cfg2:
-                show_polygons = st.checkbox("Capa polígonos", value=True)
-                show_bubbles = st.checkbox("Capa burbujas", value=False)
-                show_labels = st.checkbox("Etiquetas top radios", value=False)
-            with cfg3:
-                extruded = st.checkbox("Vista 3D", value=False)
+                max_radios_render = st.slider(
+                    "Máximo radios a dibujar",
+                    min_value=500,
+                    max_value=15000,
+                    value=6000,
+                    step=500,
+                    help="Si el filtro devuelve más radios, la app conserva los de mayor valor para proteger performance.",
+                )
+            with cfg4:
+                polygon_opacity = st.slider("Opacidad polígonos", 40, 240, 165, 5)
+                border_opacity = st.slider("Opacidad bordes", 0, 220, 90, 5)
+
+            st.markdown("**Capas visibles**")
+            layer1, layer2, layer3, layer4, layer5 = st.columns(5)
+            with layer1:
+                show_polygons = st.checkbox("Coroplético", value=True)
+            with layer2:
+                show_bubbles = st.checkbox("Burbujas", value=False)
+            with layer3:
+                show_heatmap = st.checkbox("Calor", value=False)
+            with layer4:
+                show_labels = st.checkbox("Etiquetas top", value=False)
+            with layer5:
+                extruded = st.checkbox("3D", value=False)
+
+            adv1, adv2, adv3, adv4 = st.columns(4)
+            with adv1:
+                border_width = st.slider("Grosor borde", 0.1, 3.0, 0.4, 0.1)
+            with adv2:
+                bubble_scale = st.slider("Escala burbujas", 0.3, 3.0, 1.0, 0.1)
+            with adv3:
+                heatmap_radius = st.slider("Radio capa calor", 20, 140, 55, 5)
+            with adv4:
                 label_top_n = st.slider("Cantidad de etiquetas", 5, 100, 20, 5)
+
+            st.markdown("**Filtro visual de radios**")
+            f1, f2, f3 = st.columns(3)
+            with f1:
+                map_filter_mode = st.selectbox(
+                    "Mostrar",
+                    ["Todos los radios filtrados", "Top N por valor", "Percentil superior", "Valor mínimo"],
+                    index=0,
+                )
+            with f2:
+                top_n_map = st.number_input("Top N", min_value=50, max_value=20000, value=3000, step=50)
+                percentile_min = st.slider("Desde percentil", 50, 99, 80, 1)
+            with f3:
+                min_value_map = st.number_input("Valor mínimo", min_value=0.0, value=0.0, step=10.0)
 
             if st.button("Generar mapa", type="primary"):
                 try:
@@ -1387,35 +1592,78 @@ else:
                             suffixes=("", "_dato"),
                         )
                         gdf_plot = drop_duplicated_columns_keep_first(gdf_plot)
+                        gdf_plot["conteo"] = pd.to_numeric(gdf_plot["conteo"], errors="coerce").fillna(0)
+
+                        radios_originales = len(gdf_plot)
+                        if map_filter_mode == "Top N por valor":
+                            gdf_plot = gdf_plot.sort_values("conteo", ascending=False).head(int(top_n_map))
+                        elif map_filter_mode == "Percentil superior":
+                            threshold = gdf_plot["conteo"].quantile(float(percentile_min) / 100)
+                            gdf_plot = gdf_plot[gdf_plot["conteo"] >= threshold]
+                        elif map_filter_mode == "Valor mínimo":
+                            gdf_plot = gdf_plot[gdf_plot["conteo"] >= float(min_value_map)]
+
+                        if len(gdf_plot) > int(max_radios_render):
+                            st.warning(
+                                f"El filtro devolvió {len(gdf_plot):,} radios. Para cuidar performance se muestran los {int(max_radios_render):,} de mayor valor."
+                                .replace(",", ".")
+                            )
+                            gdf_plot = gdf_plot.sort_values("conteo", ascending=False).head(int(max_radios_render))
 
                     if gdf_plot.empty:
-                        st.warning("El join entre radios y datos censales quedó vacío.")
+                        st.warning("El join entre radios y datos censales quedó vacío o el filtro visual eliminó todos los radios.")
                     else:
-                        st.caption(f"Fuente del mapa: {radio_source}")
-                        deck, map_summary = build_choropleth_map(
+                        st.caption(
+                            f"Fuente del mapa: {radio_source}. Radios base: {format_number(radios_originales)} · Radios renderizados: {format_number(len(gdf_plot))}."
+                        )
+                        deck, map_summary, legend_df = build_choropleth_map(
                             gdf_plot,
                             year=year_selected,
                             value_col="conteo",
                             simplify_tolerance=simplify_tolerance,
                             metric_mode=metric_mode,
+                            color_method=color_method,
+                            color_palette=color_palette,
+                            clip_upper_pct=clip_upper_pct,
+                            polygon_opacity=polygon_opacity,
+                            border_opacity=border_opacity,
+                            border_width=border_width,
                             show_polygons=show_polygons,
                             show_bubbles=show_bubbles,
+                            show_heatmap=show_heatmap,
                             show_labels=show_labels,
                             label_top_n=label_top_n,
+                            bubble_scale=bubble_scale,
+                            heatmap_radius=heatmap_radius,
                             extruded=extruded,
                         )
                         st.pydeck_chart(deck, use_container_width=True)
 
-                        m1, m2, m3 = st.columns(3)
+                        m1, m2, m3, m4 = st.columns(4)
                         m1.metric("Radios mapeados", format_number(len(gdf_plot)))
                         m2.metric("Área aproximada km²", format_number(map_summary["area_km2"].sum()))
                         m3.metric("Valor/km² promedio", format_number(map_summary["valor_por_km2"].mean()))
+                        m4.metric("Máximo radio", format_number(map_summary["conteo"].max()))
 
-                        with st.expander("Tabla de radios mapeados"):
-                            st.dataframe(
-                                map_summary.sort_values("conteo", ascending=False).head(1000),
-                                use_container_width=True,
-                                hide_index=True,
+                        with st.expander("Leyenda y escala"):
+                            legend_show = legend_df.copy()
+                            legend_show["referencia"] = legend_show["referencia"].map(format_number)
+                            st.dataframe(legend_show, use_container_width=True, hide_index=True)
+                            st.caption(
+                                "La leyenda es referencial: muestra valores aproximados en los percentiles 10, 50 y 90 de la métrica usada para colorear."
+                            )
+
+                        with st.expander("Top radios mapeados"):
+                            top_map = map_summary.sort_values("conteo", ascending=False).head(1000).copy()
+                            if "percentil_mapa" in top_map.columns:
+                                top_map["percentil_mapa"] = top_map["percentil_mapa"].map(lambda x: f"{x:.1%}")
+                            st.dataframe(top_map, use_container_width=True, hide_index=True)
+                            csv_map = map_summary.to_csv(index=False).encode("utf-8-sig")
+                            st.download_button(
+                                "Descargar radios mapeados CSV",
+                                data=csv_map,
+                                file_name=f"radios_mapa_{year_selected}_{variable_selected}.csv".replace(" ", "_"),
+                                mime="text/csv",
                             )
                 except Exception as exc:
                     st.error("No pude generar el mapa.")
