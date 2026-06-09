@@ -337,43 +337,77 @@ def enrich_result(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def build_bar_chart(df: pd.DataFrame, label_col: str, top_n: int):
+def measure_value_meta(measure_mode: str) -> tuple[str, str, str]:
+    """Título de eje, formato Altair y esquema de color según el modo de medición.
+
+    En los modos porcentuales la columna ``conteo`` ya viene multiplicada por 100
+    (p. ej. 23.5 significa 23,5%), por eso se formatea con un decimal y sufijo %.
+    """
+    if measure_mode == "Conteo absoluto":
+        return "Valor", ",.0f", "blues"
+    return "Porcentaje (%)", ",.1f", "teals"
+
+
+# Tooltip homogéneo: evita volcar columnas crudas y respeta el formato de cada métrica.
+def _value_tooltips(label_col: str, value_title: str, value_fmt: str) -> list:
+    return [
+        alt.Tooltip(f"{label_col}:N", title="Área"),
+        alt.Tooltip("conteo:Q", title=value_title, format=value_fmt),
+        alt.Tooltip("pct_total:Q", title="% del total", format=".1%"),
+        alt.Tooltip("ranking:Q", title="Ranking"),
+    ]
+
+
+def build_bar_chart(df: pd.DataFrame, label_col: str, top_n: int, measure_mode: str = "Conteo absoluto"):
     chart_df = enrich_result(df).head(int(top_n))
-    return (
-        alt.Chart(chart_df)
-        .mark_bar()
-        .encode(
-            x=alt.X("conteo:Q", title="Valor"),
-            y=alt.Y(f"{label_col}:N", sort="-x", title=""),
-            tooltip=[c for c in chart_df.columns if c != "conteo_acum"],
-        )
-        .properties(height=max(300, min(850, 24 * len(chart_df))))
+    value_title, value_fmt, scheme = measure_value_meta(measure_mode)
+    base = alt.Chart(chart_df).encode(
+        y=alt.Y(f"{label_col}:N", sort="-x", title=""),
+        x=alt.X("conteo:Q", title=value_title, axis=alt.Axis(format=value_fmt)),
     )
+    bars = base.mark_bar().encode(
+        color=alt.Color("conteo:Q", scale=alt.Scale(scheme=scheme), legend=None),
+        tooltip=_value_tooltips(label_col, value_title, value_fmt),
+    )
+    labels = base.mark_text(align="left", dx=4, baseline="middle", color="#333").encode(
+        text=alt.Text("conteo:Q", format=value_fmt),
+    )
+    return (bars + labels).properties(height=max(300, min(850, 26 * len(chart_df))))
 
 
-def build_pareto_chart(df: pd.DataFrame, label_col: str, top_n: int):
+def build_pareto_chart(df: pd.DataFrame, label_col: str, top_n: int, measure_mode: str = "Conteo absoluto"):
     chart_df = enrich_result(df).head(int(top_n))
+    value_title, value_fmt, scheme = measure_value_meta(measure_mode)
     base = alt.Chart(chart_df).encode(x=alt.X(f"{label_col}:N", sort="-y", title=""))
-    bars = base.mark_bar(opacity=0.75).encode(
-        y=alt.Y("conteo:Q", title="Valor"),
-        tooltip=[label_col, "conteo", alt.Tooltip("pct_total:Q", format=".1%"), alt.Tooltip("pct_acum:Q", format=".1%")],
+    bars = base.mark_bar(opacity=0.8).encode(
+        y=alt.Y("conteo:Q", title=value_title, axis=alt.Axis(format=value_fmt)),
+        color=alt.Color("conteo:Q", scale=alt.Scale(scheme=scheme), legend=None),
+        tooltip=_value_tooltips(label_col, value_title, value_fmt)
+        + [alt.Tooltip("pct_acum:Q", title="% acumulado", format=".1%")],
     )
-    line = base.mark_line(point=True).encode(
+    line = base.mark_line(point=True, color="#d62728").encode(
         y=alt.Y("pct_acum:Q", title="% acumulado", axis=alt.Axis(format="%")),
-        tooltip=[label_col, alt.Tooltip("pct_acum:Q", format=".1%")],
+        tooltip=[
+            alt.Tooltip(f"{label_col}:N", title="Área"),
+            alt.Tooltip("pct_acum:Q", title="% acumulado", format=".1%"),
+        ],
     )
     return (bars + line).resolve_scale(y="independent").properties(height=420)
 
 
-def build_distribution_chart(df: pd.DataFrame):
+def build_distribution_chart(df: pd.DataFrame, measure_mode: str = "Conteo absoluto"):
     chart_df = enrich_result(df)
+    value_title, value_fmt, _ = measure_value_meta(measure_mode)
     return (
         alt.Chart(chart_df)
-        .mark_bar()
+        .mark_bar(color="#2c7fb8")
         .encode(
-            x=alt.X("conteo:Q", bin=alt.Bin(maxbins=35), title="Valor"),
+            x=alt.X("conteo:Q", bin=alt.Bin(maxbins=35), title=value_title, axis=alt.Axis(format=value_fmt)),
             y=alt.Y("count():Q", title="Cantidad de áreas"),
-            tooltip=[alt.Tooltip("count():Q", title="Áreas")],
+            tooltip=[
+                alt.Tooltip("conteo:Q", bin=alt.Bin(maxbins=35), title=value_title, format=value_fmt),
+                alt.Tooltip("count():Q", title="Áreas"),
+            ],
         )
         .properties(height=360)
     )
@@ -381,17 +415,22 @@ def build_distribution_chart(df: pd.DataFrame):
 
 def build_share_chart(df: pd.DataFrame, label_col: str, top_n: int):
     chart_df = enrich_result(df).head(int(top_n)).copy()
-    chart_df["pct_label"] = chart_df["pct_total"]
-    return (
-        alt.Chart(chart_df)
-        .mark_bar()
-        .encode(
-            x=alt.X("pct_label:Q", title="Participación", axis=alt.Axis(format="%")),
-            y=alt.Y(f"{label_col}:N", sort="-x", title=""),
-            tooltip=[label_col, "conteo", alt.Tooltip("pct_total:Q", format=".1%")],
-        )
-        .properties(height=max(300, min(850, 24 * len(chart_df))))
+    base = alt.Chart(chart_df).encode(
+        y=alt.Y(f"{label_col}:N", sort="-x", title=""),
+        x=alt.X("pct_total:Q", title="Participación", axis=alt.Axis(format="%")),
     )
+    bars = base.mark_bar().encode(
+        color=alt.Color("pct_total:Q", scale=alt.Scale(scheme="oranges"), legend=None),
+        tooltip=[
+            alt.Tooltip(f"{label_col}:N", title="Área"),
+            alt.Tooltip("conteo:Q", title="Valor", format=",.1f"),
+            alt.Tooltip("pct_total:Q", title="% del total", format=".1%"),
+        ],
+    )
+    labels = base.mark_text(align="left", dx=4, baseline="middle", color="#333").encode(
+        text=alt.Text("pct_total:Q", format=".1%"),
+    )
+    return (bars + labels).properties(height=max(300, min(850, 26 * len(chart_df))))
 
 
 def summarize_result(df: pd.DataFrame, label_col: str | None) -> dict[str, object]:
@@ -1524,17 +1563,27 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Variable")
+
+    def _sync_search_from_theme() -> None:
+        """Al cambiar el tema, refresca el buscador con sus términos sugeridos."""
+        theme = st.session_state.get("theme_selected", "General")
+        st.session_state["variable_search"] = " OR ".join(VARIABLE_THEMES.get(theme, ["pob"])[:3])
+
+    if "variable_search" not in st.session_state:
+        _sync_search_from_theme()
+
     theme_selected = st.selectbox(
         "Tema de variables",
         list(VARIABLE_THEMES.keys()),
         index=0,
+        key="theme_selected",
+        on_change=_sync_search_from_theme,
         help="Preselecciona términos de búsqueda para descubrir variables reales del censo.",
     )
-    default_search = " OR ".join(VARIABLE_THEMES.get(theme_selected, ["pob"])[:3])
     variable_search = st.text_input(
         "Buscar variable",
-        value=default_search,
-        help="Busca sobre las variables presentes en census-data.parquet. Podés escribir edad, sexo, vivienda, agua, educación, internet, etc.",
+        key="variable_search",
+        help="Busca sobre las variables presentes en census-data.parquet. Podés escribir edad, sexo, vivienda, agua, educación, internet, etc. Separá términos con OR.",
     )
 
     # El buscador admite términos separados por OR para ampliar el descubrimiento temático.
@@ -1558,12 +1607,19 @@ with st.sidebar:
         variable_options = [("POB_TOT_P", "POB_TOT_P · Población total [radios.parquet]")]
 
     variable_label_to_code = {label: code for code, label in variable_options}
+    option_labels = list(variable_label_to_code.keys())
+    st.caption(f"{len(option_labels)} variable(s) coinciden con la búsqueda.")
+
+    # Preserva la variable elegida cuando la búsqueda cambia pero la variable sigue disponible.
+    prev_code = st.session_state.get("variable_selected_code")
+    default_index = next((i for i, lbl in enumerate(option_labels) if variable_label_to_code[lbl] == prev_code), 0)
     selected_variable_label = st.selectbox(
         "Variable censal",
-        list(variable_label_to_code.keys()),
-        index=0,
+        option_labels,
+        index=default_index,
     )
-    variable_selected = variable_label_to_code.get(selected_variable_label, "POB_TOT_P")
+    variable_selected = variable_label_to_code.get(selected_variable_label, option_labels and variable_label_to_code[option_labels[0]] or "POB_TOT_P")
+    st.session_state["variable_selected_code"] = variable_selected
 
     use_manual_variable = st.checkbox(
         "Escribir código manualmente",
@@ -1608,29 +1664,47 @@ with st.sidebar:
     selected_dept_label = st.selectbox("Departamento", list(dept_options.keys()))
     departamento_code = dept_options[selected_dept_label]
 
+    # Contexto de la variable: define qué filtros tienen sentido aguas abajo.
+    is_radios_var = variable_selected in RADIOS_NUMERIC_VARIABLES
+    categorias = ensure_dataframe(get_categorias(year_selected, variable_selected), "categorías")
+    has_categories = (not categorias.empty) and ("valor_categoria" in categorias.columns)
+
+    if is_radios_var:
+        st.info("ℹ️ Variable de `radios.parquet`: se mide como total geográfico, sin categorías.")
+    elif has_categories:
+        st.caption(f"Esta variable tiene {len(categorias)} categoría(s) disponibles.")
+    else:
+        st.caption("Esta variable no expone categorías en census-data.parquet.")
+
+    st.divider()
+    st.subheader("Categoría")
+    cat_options = {"Todas": "__ALL__"}
+    if has_categories:
+        for _, row in categorias.iterrows():
+            label = f"{row.get('etiqueta_categoria', '')} ({row.get('valor_categoria', '')})"
+            cat_options[label] = str(row["valor_categoria"])
+        selected_cat_label = st.selectbox("Categoría", list(cat_options.keys()))
+        categoria_value = cat_options[selected_cat_label]
+    else:
+        st.selectbox("Categoría", ["Todas"], disabled=True, help="La variable seleccionada no tiene categorías para filtrar.")
+        categoria_value = "__ALL__"
+
     st.divider()
     st.subheader("Medición")
+    # En variables de radios el "% dentro de la variable" da siempre 100%: se oculta.
+    available_measures = [m for m in MEASURE_MODES if not (is_radios_var and m == "% dentro de la variable")]
     measure_mode = st.selectbox(
         "Cómo medir",
-        MEASURE_MODES,
+        available_measures,
         index=0,
         help="Usá porcentajes para comparar zonas de distinto tamaño. El conteo absoluto sirve para volumen/concentración.",
     )
 
     st.divider()
-    st.subheader("Categoría")
-    categorias = ensure_dataframe(get_categorias(year_selected, variable_selected), "categorías")
-    cat_options = {"Todas": "__ALL__"}
-    if not categorias.empty and "valor_categoria" in categorias.columns:
-        for _, row in categorias.iterrows():
-            label = f"{row.get('etiqueta_categoria', '')} ({row.get('valor_categoria', '')})"
-            cat_options[label] = str(row["valor_categoria"])
-    selected_cat_label = st.selectbox("Categoría", list(cat_options.keys()))
-    categoria_value = cat_options[selected_cat_label]
-
-    st.divider()
-    group_options = list(GROUP_MAP_LONG.keys())
-    group_selected = st.selectbox("Agrupar por", group_options, index=1)
+    # "Categoría" como agrupación sólo aplica si la variable realmente tiene categorías.
+    group_options = [g for g in GROUP_MAP_LONG.keys() if not (g == "Categoría" and (is_radios_var or not has_categories))]
+    default_group = "Departamento" if "Departamento" in group_options else group_options[0]
+    group_selected = st.selectbox("Agrupar por", group_options, index=group_options.index(default_group))
     limit_rows = st.slider("Máximo de filas", min_value=10, max_value=5000, value=500, step=10)
 
 
@@ -1739,16 +1813,16 @@ else:
             chart_a, chart_b = st.columns(2)
             with chart_a:
                 st.markdown("**Ranking de áreas**")
-                st.altair_chart(build_bar_chart(df_enriched, label_col, top_n_chart), use_container_width=True)
+                st.altair_chart(build_bar_chart(df_enriched, label_col, top_n_chart, measure_mode), use_container_width=True)
             with chart_b:
                 st.markdown("**Participación sobre el total**")
                 st.altair_chart(build_share_chart(df_enriched, label_col, top_n_chart), use_container_width=True)
 
             st.markdown("**Pareto: acumulado del top seleccionado**")
-            st.altair_chart(build_pareto_chart(df_enriched, label_col, top_n_chart), use_container_width=True)
+            st.altair_chart(build_pareto_chart(df_enriched, label_col, top_n_chart, measure_mode), use_container_width=True)
 
             st.markdown("**Distribución de valores entre áreas**")
-            st.altair_chart(build_distribution_chart(df_enriched), use_container_width=True)
+            st.altair_chart(build_distribution_chart(df_enriched, measure_mode), use_container_width=True)
 
             with st.expander("Lectura rápida"):
                 st.write(
