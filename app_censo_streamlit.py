@@ -1397,6 +1397,8 @@ def build_choropleth_map(
     extruded: bool = False,
     base_map_style: str = "Calles y etiquetas (CARTO Voyager)",
     map_height: int = 680,
+    variable_label: str = "",
+    nivel_label: str = "",
 ):
     if pdk is None:
         raise RuntimeError("Falta pydeck. Instalá: pip install pydeck")
@@ -1601,10 +1603,18 @@ def build_choropleth_map(
 
     view_state = compute_view_state(gdf, extruded=extruded)
 
+    # Encabezado del tooltip con la variable y el nivel (categoría) que se está mapeando.
+    header_lines = ""
+    if variable_label:
+        header_lines += f"<div style='font-weight:600;margin-bottom:4px'>{variable_label}</div>"
+    if nivel_label:
+        header_lines += f"<div style='color:#555;margin-bottom:4px'>Nivel: {nivel_label}</div>"
+
     tooltip = {
         "html": (
             "<div style='min-width:210px'>"
-            "<b>Radio:</b> {" + join_col + "}<br/>"
+            + header_lines
+            + "<b>Radio:</b> {" + join_col + "}<br/>"
             "<b>Valor:</b> {valor_fmt}<br/>"
             "<b>Ranking:</b> {ranking_mapa}<br/>"
             "<b>Percentil:</b> {percentil_mapa_pct}<br/>"
@@ -1787,6 +1797,7 @@ with st.sidebar:
     else:
         st.selectbox("Categoría", ["Todas"], disabled=True, help="La variable seleccionada no tiene categorías para filtrar.")
         categoria_value = "__ALL__"
+        selected_cat_label = "Todas"
 
     st.divider()
     st.subheader("Medición")
@@ -1819,6 +1830,48 @@ if variable_label_text:
     st.caption(f"📋 **{variable_selected}** — {variable_label_text}")
 else:
     st.caption(f"📋 **{variable_selected}** — sin descripción en metadata.parquet para este año.")
+
+with st.expander("🔢 Niveles (categorías) de la variable", expanded=False):
+    if is_radios_var:
+        st.info("Esta variable proviene de `radios.parquet`: es un total geográfico, no tiene niveles.")
+    elif not has_categories:
+        st.info("Esta variable no expone categorías en census-data.parquet.")
+    else:
+        geo_txt = "todo el país" if provincia_code == "__ALL__" else selected_prov_label.split(" (")[0]
+        if departamento_code != "__ALL__":
+            geo_txt = f"{selected_dept_label.split(' (')[0]} ({geo_txt})"
+        st.caption(
+            f"Conteo de cada nivel para **{geo_txt}**. "
+            "Para desagregar los gráficos por estos niveles, elegí «Agrupar por: Categoría»."
+        )
+        try:
+            # group_label='Categoría' + categoría '__ALL__' devuelve todos los niveles con su conteo.
+            niveles = enrich_result(
+                query_censo_long(
+                    year_selected, variable_selected, provincia_code, departamento_code,
+                    "__ALL__", "Categoría", 0,
+                )
+            )
+            if niveles.empty:
+                st.warning("No hay datos de niveles para este recorte geográfico.")
+            else:
+                niveles_disp = humanize_area_labels(niveles, "Categoría", year_selected, provincia_code)
+                tabla = pd.DataFrame({
+                    "Nivel": niveles_disp["area_label"],
+                    "Código": niveles_disp.get("valor_categoria", "").astype(str),
+                    "Conteo": niveles_disp["conteo"].map(format_number),
+                    "% del total": niveles_disp["pct_total"].map(lambda x: f"{x:.1%}"),
+                })
+                col_tabla, col_chart = st.columns([1, 1])
+                with col_tabla:
+                    st.dataframe(tabla, use_container_width=True, hide_index=True)
+                with col_chart:
+                    st.altair_chart(
+                        build_bar_chart(niveles_disp, "area_label", min(30, len(niveles_disp)), "Conteo absoluto"),
+                        use_container_width=True,
+                    )
+        except Exception as exc:
+            st.caption(f"No pude calcular los niveles: {exc}")
 
 try:
     df_result, query_source = query_censo_resilient(
@@ -1943,6 +1996,16 @@ else:
         st.caption(
             "Para evitar tiempos de carga altos, conviene filtrar al menos una provincia y, si es Buenos Aires/CABA, idealmente un departamento/comuna."
         )
+
+        # Qué se está mapeando: variable, nivel (categoría), medición. Visible siempre.
+        nivel_mapa_txt = "Todos los niveles (suma)" if categoria_value == "__ALL__" else selected_cat_label.split(" (")[0]
+        desc_mapa = f" — {variable_label_text}" if variable_label_text else ""
+        st.info(
+            f"🗺️ **Mapeando:** {variable_selected}{desc_mapa}  ·  "
+            f"**Nivel:** {nivel_mapa_txt}  ·  **Medición:** {measure_mode}"
+        )
+        if has_categories and categoria_value == "__ALL__":
+            st.caption("💡 Para mapear un nivel específico (p. ej. solo «Mujer»), elegí la **Categoría** en el panel izquierdo.")
 
         if gpd is None or pdk is None:
             st.warning(
@@ -2141,6 +2204,8 @@ else:
                             extruded=extruded,
                             base_map_style=base_map_style,
                             map_height=map_height,
+                            variable_label=f"{variable_selected} — {variable_label_text}" if variable_label_text else variable_selected,
+                            nivel_label="" if categoria_value == "__ALL__" else nivel_mapa_txt,
                         )
                         st.pydeck_chart(deck, use_container_width=True)
 
@@ -2150,12 +2215,25 @@ else:
                         m3.metric("Valor/km² promedio", format_number(map_summary["valor_por_km2"].mean()))
                         m4.metric("Máximo radio", format_number(map_summary["conteo"].max()))
 
-                        with st.expander("Leyenda y escala"):
-                            legend_show = legend_df.copy()
-                            legend_show["referencia"] = legend_show["referencia"].map(format_number)
-                            st.dataframe(legend_show, use_container_width=True, hide_index=True)
+                        with st.expander("Leyenda y escala", expanded=True):
+                            st.markdown(f"**Variable:** {variable_selected}" + (f" — {variable_label_text}" if variable_label_text else ""))
+                            st.markdown(f"**Nivel mapeado:** {nivel_mapa_txt}")
+                            st.markdown(
+                                f"**Métrica de color:** {metric_mode}  ·  **Escala:** {color_method}  ·  **Medición:** {measure_mode}"
+                            )
+                            # Barras de color con su valor de referencia (percentiles 10/50/90).
+                            chips = "".join(
+                                "<div style='display:flex;align-items:center;margin:2px 0'>"
+                                f"<span style='display:inline-block;width:22px;height:14px;background:{row.color};"
+                                "border:1px solid #999;margin-right:8px'></span>"
+                                f"<span>{row.tramo} · ≈ {format_number(row.referencia)}</span>"
+                                "</div>"
+                                for row in legend_df.itertuples()
+                            )
+                            st.markdown(chips, unsafe_allow_html=True)
                             st.caption(
-                                "La leyenda es referencial: muestra valores aproximados en los percentiles 10, 50 y 90 de la métrica usada para colorear."
+                                "Referencial: cada color corresponde aproximadamente a los percentiles 10, 50 y 90 "
+                                "de la métrica usada para colorear."
                             )
 
                         with st.expander("Top radios mapeados"):
