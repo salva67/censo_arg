@@ -117,3 +117,10 @@ No requiere secrets ni credenciales porque consulta datos públicos remotos.
 ## Licencia
 
 Definir antes de publicar si el repositorio será público. Una opción habitual para proyectos demostrativos es MIT, pero conviene confirmarlo según el uso previsto.
+
+
+## Nota sobre variables POB_TOT_P / VIV_TOT_P
+
+La app consulta primero la tabla larga `census-data.parquet`. Para variables de totales muy usadas, como `POB_TOT_P` y `VIV_TOT_P`, la versión actual también puede consultar directamente `radios.parquet`, donde esas columnas están disponibles como atributos de los radios censales. Esto evita consultas vacías cuando esos totales no aparecen como filas en la tabla larga o cuando el filtro elegido no corresponde a una variable categórica.
+
+Si una consulta devuelve vacío, la app muestra un diagnóstico con el conteo exacto en `census-data.parquet` y variables parecidas disponibles.
