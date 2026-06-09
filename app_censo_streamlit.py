@@ -3,29 +3,31 @@
 Dashboard Streamlit para consultar el Censo Argentino publicado en Source Cooperative
 sin usar el plugin de QGIS.
 
-Versión robusta:
-- El selector de variables se arma desde las variables REALES presentes en census-data.parquet.
-- Si una variable común de totales, como POB_TOT_P o VIV_TOT_P, no aparece en la tabla larga,
-  el dashboard hace fallback a radios.parquet, donde esas columnas existen para 2022.
-- Incluye diagnóstico cuando una consulta no devuelve filas.
+Funcionalidades:
+- Consulta remota de Parquet/GeoParquet con DuckDB.
+- Filtros por año, variable censal, provincia, departamento y categoría.
+- Agregación por provincia, departamento, categoría o radio.
+- Tabla descargable en CSV.
+- Gráfico de barras de principales resultados.
+- Mapa opcional de radios censales usando GeoParquet + GeoPandas + PyDeck.
+- Consola SQL avanzada para consultas directas.
 
 Ejecutar:
     streamlit run app_censo_streamlit.py
+
+Instalar dependencias:
+    pip install -r requirements_censo_streamlit.txt
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
-import os
-from pathlib import Path
 from typing import Iterable
 
 import altair as alt
 import duckdb
 import pandas as pd
 import streamlit as st
-import requests
 
 try:
     import geopandas as gpd
@@ -47,7 +49,6 @@ st.set_page_config(
 
 VALID_YEARS = [1991, 2001, 2010, 2022]
 BASE_URL = "https://data.source.coop/nlebovits/censo-argentino/{year}/{filename}"
-CACHE_DIR = Path(os.getenv("CENSO_CACHE_DIR", "/tmp/censo_argentino_cache"))
 FILES = {
     "census": "census-data.parquet",
     "metadata": "metadata.parquet",
@@ -60,14 +61,7 @@ JOIN_COL_BY_YEAR = {
     2022: "COD_2022",
 }
 
-# Estas columnas figuran en radios.parquet para 2022 y suelen ser útiles como consulta inicial.
-# En caso de que no estén en census-data.parquet, se consultan directamente desde radios.parquet.
-RADIOS_NUMERIC_VARIABLES = {
-    "POB_TOT_P": "Población total",
-    "VIV_TOT_P": "Viviendas totales",
-}
-
-GROUP_MAP_LONG = {
+GROUP_MAP = {
     "Provincia": ["valor_provincia", "etiqueta_provincia"],
     "Departamento": [
         "valor_provincia",
@@ -79,11 +73,10 @@ GROUP_MAP_LONG = {
     "Radio censal": ["id_geo"],
 }
 
-GROUP_MAP_RADIOS = {
-    "Provincia": ["PROV"],
-    "Departamento": ["PROV", "DEPTO"],
-    "Radio censal": [],  # se completa dinámicamente con COD_YYYY
-}
+DEFAULT_VARIABLE_HINTS = [
+    "POB_TOT_P",
+    "VIV_TOT_P",
+]
 
 
 # -----------------------------------------------------------------------------
@@ -105,7 +98,6 @@ def sql_quote(value: object) -> str:
 @st.cache_resource(show_spinner=False)
 def get_connection() -> duckdb.DuckDBPyConnection:
     con = duckdb.connect(database=":memory:")
-    # httpfs permite leer Parquet remoto por HTTPS/S3.
     con.execute("INSTALL httpfs;")
     con.execute("LOAD httpfs;")
     con.execute("SET threads TO 4;")
@@ -118,7 +110,7 @@ def run_sql(sql: str) -> pd.DataFrame:
     return con.execute(sql).df()
 
 
-def build_where_long(
+def build_where(
     variable: str | None = None,
     provincia_code: str | None = None,
     departamento_code: str | None = None,
@@ -141,19 +133,8 @@ def build_where_long(
     return " AND ".join(filters) if filters else "1 = 1"
 
 
-def build_where_radios(provincia_code: str | None = None, departamento_code: str | None = None) -> str:
-    filters: list[str] = []
-
-    if provincia_code and provincia_code != "__ALL__":
-        # Se normaliza con LPAD para tolerar códigos con/sin cero a la izquierda.
-        filters.append(f"LPAD(CAST(PROV AS VARCHAR), 2, '0') = LPAD({sql_quote(provincia_code)}, 2, '0')")
-
-    if departamento_code and departamento_code != "__ALL__":
-        filters.append(
-            f"LPAD(CAST(DEPTO AS VARCHAR), 3, '0') = LPAD({sql_quote(departamento_code)}, 3, '0')"
-        )
-
-    return " AND ".join(filters) if filters else "1 = 1"
+def safe_sort_cols(df: pd.DataFrame, preferred: Iterable[str]) -> list[str]:
+    return [c for c in preferred if c in df.columns]
 
 
 def infer_col(df: pd.DataFrame, candidates: list[str], contains_any: list[str] | None = None) -> str | None:
@@ -168,12 +149,6 @@ def infer_col(df: pd.DataFrame, candidates: list[str], contains_any: list[str] |
             if all(token.lower() in col_lower for token in contains_any):
                 return col
     return None
-
-
-def format_number(value: float | int | None) -> str:
-    if value is None or pd.isna(value):
-        return "-"
-    return f"{float(value):,.0f}".replace(",", ".")
 
 
 # -----------------------------------------------------------------------------
@@ -194,66 +169,6 @@ def get_metadata(year: int) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60)
-def get_census_variables(year: int, search: str | None = None, limit: int = 500) -> pd.DataFrame:
-    """Devuelve variables realmente presentes en census-data.parquet, enriquecidas con metadata."""
-    census_url = source_url(year, "census")
-    metadata_url = source_url(year, "metadata")
-    term = (search or "").strip()
-
-    where = ""
-    if term:
-        quoted_like = sql_quote(f"%{term}%")
-        where = f"""
-        WHERE lower(v.codigo_variable) LIKE lower({quoted_like})
-           OR lower(COALESCE(m.etiqueta_variable, '')) LIKE lower({quoted_like})
-        """
-
-    sql = f"""
-    WITH vars AS (
-        SELECT DISTINCT codigo_variable
-        FROM read_parquet({sql_quote(census_url)})
-        WHERE codigo_variable IS NOT NULL
-    ), meta AS (
-        SELECT
-            codigo_variable,
-            any_value(etiqueta_variable) AS etiqueta_variable
-        FROM read_parquet({sql_quote(metadata_url)})
-        WHERE codigo_variable IS NOT NULL
-        GROUP BY 1
-    )
-    SELECT
-        v.codigo_variable,
-        COALESCE(m.etiqueta_variable, '') AS etiqueta_variable,
-        'census-data' AS fuente
-    FROM vars v
-    LEFT JOIN meta m USING (codigo_variable)
-    {where}
-    ORDER BY v.codigo_variable
-    LIMIT {int(limit)}
-    """
-
-    df = run_sql(sql)
-
-    # Agregamos variables útiles desde radios.parquet, para que POB_TOT_P/VIV_TOT_P funcionen
-    # aunque no aparezcan en la tabla larga del año elegido.
-    radios_rows = []
-    for code, label in RADIOS_NUMERIC_VARIABLES.items():
-        if not term or term.lower() in code.lower() or term.lower() in label.lower():
-            if code not in set(df.get("codigo_variable", pd.Series(dtype=str)).astype(str)):
-                radios_rows.append(
-                    {
-                        "codigo_variable": code,
-                        "etiqueta_variable": label,
-                        "fuente": "radios.parquet",
-                    }
-                )
-    if radios_rows:
-        df = pd.concat([pd.DataFrame(radios_rows), df], ignore_index=True)
-
-    return df
-
-
-@st.cache_data(show_spinner=False, ttl=60 * 60)
 def get_provincias(year: int) -> pd.DataFrame:
     url = source_url(year, "census")
     sql = f"""
@@ -271,7 +186,7 @@ def get_provincias(year: int) -> pd.DataFrame:
 @st.cache_data(show_spinner=False, ttl=60 * 60)
 def get_departamentos(year: int, provincia_code: str | None) -> pd.DataFrame:
     url = source_url(year, "census")
-    where = build_where_long(provincia_code=provincia_code)
+    where = build_where(provincia_code=provincia_code)
     sql = f"""
     SELECT DISTINCT
         valor_departamento,
@@ -286,34 +201,8 @@ def get_departamentos(year: int, provincia_code: str | None) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60)
-def get_geo_names(year: int) -> pd.DataFrame:
-    """Dimensión geográfica con etiquetas de provincia/departamento desde census-data.parquet."""
-    url = source_url(year, "census")
-    sql = f"""
-    SELECT
-        LPAD(CAST(valor_provincia AS VARCHAR), 2, '0') AS prov_norm,
-        any_value(valor_provincia) AS valor_provincia,
-        any_value(etiqueta_provincia) AS etiqueta_provincia,
-        LPAD(CAST(valor_departamento AS VARCHAR), 3, '0') AS depto_norm,
-        any_value(valor_departamento) AS valor_departamento,
-        any_value(etiqueta_departamento) AS etiqueta_departamento
-    FROM read_parquet({sql_quote(url)})
-    WHERE valor_provincia IS NOT NULL
-      AND etiqueta_provincia IS NOT NULL
-      AND valor_departamento IS NOT NULL
-      AND etiqueta_departamento IS NOT NULL
-    GROUP BY 1, 4
-    """
-    return run_sql(sql)
-
-
-@st.cache_data(show_spinner=False, ttl=60 * 60)
 def get_categorias(year: int, variable: str | None) -> pd.DataFrame:
     if not variable:
-        return pd.DataFrame(columns=["valor_categoria", "etiqueta_categoria"])
-
-    # Las variables provenientes de radios.parquet no tienen categorías.
-    if variable in RADIOS_NUMERIC_VARIABLES:
         return pd.DataFrame(columns=["valor_categoria", "etiqueta_categoria"])
 
     url = source_url(year, "census")
@@ -335,7 +224,7 @@ def get_categorias(year: int, variable: str | None) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=True, ttl=60 * 30)
-def query_censo_long(
+def query_censo(
     year: int,
     variable: str,
     provincia_code: str | None,
@@ -345,8 +234,8 @@ def query_censo_long(
     limit: int,
 ) -> pd.DataFrame:
     url = source_url(year, "census")
-    group_cols = GROUP_MAP_LONG[group_label]
-    where = build_where_long(
+    group_cols = GROUP_MAP[group_label]
+    where = build_where(
         variable=variable,
         provincia_code=provincia_code,
         departamento_code=departamento_code,
@@ -371,174 +260,15 @@ def query_censo_long(
 
 
 @st.cache_data(show_spinner=True, ttl=60 * 30)
-def query_censo_radios(
-    year: int,
-    variable: str,
-    provincia_code: str | None,
-    departamento_code: str | None,
-    group_label: str,
-    limit: int,
-) -> pd.DataFrame:
-    """Consulta variables que viven como columnas en radios.parquet, enriqueciendo nombres desde census-data."""
-    if variable not in RADIOS_NUMERIC_VARIABLES:
-        return pd.DataFrame()
-    if group_label == "Categoría":
-        return pd.DataFrame()
-
-    radios_url = source_url(year, "radios")
-    census_url = source_url(year, "census")
-    join_col = JOIN_COL_BY_YEAR[year]
-    where = build_where_radios(provincia_code, departamento_code)
-
-    # geo_names evita mostrar solo códigos de departamento cuando consultamos radios.parquet.
-    geo_names_cte = f"""
-    geo_names AS (
-        SELECT
-            LPAD(CAST(valor_provincia AS VARCHAR), 2, '0') AS prov_norm,
-            any_value(valor_provincia) AS valor_provincia,
-            any_value(etiqueta_provincia) AS etiqueta_provincia,
-            LPAD(CAST(valor_departamento AS VARCHAR), 3, '0') AS depto_norm,
-            any_value(valor_departamento) AS valor_departamento,
-            any_value(etiqueta_departamento) AS etiqueta_departamento
-        FROM read_parquet({sql_quote(census_url)})
-        WHERE valor_provincia IS NOT NULL
-          AND etiqueta_provincia IS NOT NULL
-          AND valor_departamento IS NOT NULL
-          AND etiqueta_departamento IS NOT NULL
-        GROUP BY 1, 4
-    )
-    """
-
-    limit_clause = f"LIMIT {int(limit)}" if limit else ""
-
-    if group_label == "Provincia":
-        sql = f"""
-        WITH r AS (
-            SELECT
-                LPAD(CAST(PROV AS VARCHAR), 2, '0') AS prov_norm,
-                SUM({variable}) AS conteo
-            FROM read_parquet({sql_quote(radios_url)})
-            WHERE {where}
-            GROUP BY 1
-        ), {geo_names_cte}
-        SELECT
-            COALESCE(g.valor_provincia, r.prov_norm) AS valor_provincia,
-            COALESCE(g.etiqueta_provincia, r.prov_norm) AS etiqueta_provincia,
-            r.conteo
-        FROM r
-        LEFT JOIN (
-            SELECT prov_norm, any_value(valor_provincia) AS valor_provincia, any_value(etiqueta_provincia) AS etiqueta_provincia
-            FROM geo_names
-            GROUP BY 1
-        ) g USING (prov_norm)
-        ORDER BY conteo DESC
-        {limit_clause}
-        """
-        return run_sql(sql)
-
-    if group_label == "Departamento":
-        sql = f"""
-        WITH r AS (
-            SELECT
-                LPAD(CAST(PROV AS VARCHAR), 2, '0') AS prov_norm,
-                LPAD(CAST(DEPTO AS VARCHAR), 3, '0') AS depto_norm,
-                SUM({variable}) AS conteo
-            FROM read_parquet({sql_quote(radios_url)})
-            WHERE {where}
-            GROUP BY 1, 2
-        ), {geo_names_cte}
-        SELECT
-            COALESCE(g.valor_provincia, r.prov_norm) AS valor_provincia,
-            COALESCE(g.etiqueta_provincia, r.prov_norm) AS etiqueta_provincia,
-            COALESCE(g.valor_departamento, r.depto_norm) AS valor_departamento,
-            COALESCE(g.etiqueta_departamento, r.depto_norm) AS etiqueta_departamento,
-            r.conteo
-        FROM r
-        LEFT JOIN geo_names g
-          ON r.prov_norm = g.prov_norm
-         AND r.depto_norm = g.depto_norm
-        ORDER BY conteo DESC
-        {limit_clause}
-        """
-        return run_sql(sql)
-
-    if group_label == "Radio censal":
-        sql = f"""
-        SELECT
-            {join_col} AS id_geo,
-            SUM({variable}) AS conteo
-        FROM read_parquet({sql_quote(radios_url)})
-        WHERE {where}
-        GROUP BY 1
-        ORDER BY conteo DESC
-        {limit_clause}
-        """
-        return run_sql(sql)
-
-    return pd.DataFrame()
-
-
-@st.cache_data(show_spinner=True, ttl=60 * 30)
-def query_censo_resilient(
-    year: int,
-    variable: str,
-    provincia_code: str | None,
-    departamento_code: str | None,
-    categoria_value: str | None,
-    group_label: str,
-    limit: int,
-) -> tuple[pd.DataFrame, str]:
-    """Consulta principal. Si la tabla larga no tiene el total solicitado, cae a radios.parquet."""
-    # Para variables de radios, conviene ir directo al archivo geográfico si no hay categoría.
-    if variable in RADIOS_NUMERIC_VARIABLES and (not categoria_value or categoria_value == "__ALL__"):
-        df_radios = query_censo_radios(
-            year, variable, provincia_code, departamento_code, group_label, limit
-        )
-        if not df_radios.empty:
-            return df_radios, "radios.parquet"
-
-    df_long = query_censo_long(
-        year, variable, provincia_code, departamento_code, categoria_value, group_label, limit
-    )
-    if not df_long.empty:
-        return df_long, "census-data.parquet"
-
-    # Fallback final para POB_TOT_P / VIV_TOT_P si la primera consulta fue vacía.
-    if variable in RADIOS_NUMERIC_VARIABLES and (not categoria_value or categoria_value == "__ALL__"):
-        df_radios = query_censo_radios(
-            year, variable, provincia_code, departamento_code, group_label, limit
-        )
-        if not df_radios.empty:
-            return df_radios, "radios.parquet"
-
-    return df_long, "census-data.parquet"
-
-
-@st.cache_data(show_spinner=True, ttl=60 * 30)
 def query_radio_counts(
     year: int,
     variable: str,
     provincia_code: str | None,
     departamento_code: str | None,
     categoria_value: str | None,
-) -> tuple[pd.DataFrame, str]:
-    """Conteo a nivel radio para mapa."""
-    if variable in RADIOS_NUMERIC_VARIABLES and (not categoria_value or categoria_value == "__ALL__"):
-        url = source_url(year, "radios")
-        join_col = JOIN_COL_BY_YEAR[year]
-        where = build_where_radios(provincia_code, departamento_code)
-        sql = f"""
-        SELECT
-            {join_col} AS id_geo,
-            SUM({variable}) AS conteo
-        FROM read_parquet({sql_quote(url)})
-        WHERE {where}
-        GROUP BY 1
-        """
-        return run_sql(sql), "radios.parquet"
-
+) -> pd.DataFrame:
     url = source_url(year, "census")
-    where = build_where_long(
+    where = build_where(
         variable=variable,
         provincia_code=provincia_code,
         departamento_code=departamento_code,
@@ -552,47 +282,7 @@ def query_radio_counts(
     WHERE {where}
     GROUP BY 1
     """
-    return run_sql(sql), "census-data.parquet"
-
-
-@st.cache_data(show_spinner=False, ttl=60 * 30)
-def diagnose_query(
-    year: int,
-    variable: str,
-    provincia_code: str | None,
-    departamento_code: str | None,
-    categoria_value: str | None,
-) -> dict[str, pd.DataFrame]:
-    census_url = source_url(year, "census")
-    where_geo = build_where_long(
-        provincia_code=provincia_code,
-        departamento_code=departamento_code,
-        categoria_value=categoria_value,
-    )
-
-    exact_sql = f"""
-    SELECT
-        COUNT(*) AS filas,
-        SUM(conteo) AS conteo_total
-    FROM read_parquet({sql_quote(census_url)})
-    WHERE codigo_variable = {sql_quote(variable)}
-      AND {where_geo}
-    """
-
-    token = variable.strip()[:12]
-    like = sql_quote(f"%{token}%") if token else sql_quote("%%")
-    suggestions_sql = f"""
-    SELECT DISTINCT codigo_variable
-    FROM read_parquet({sql_quote(census_url)})
-    WHERE lower(codigo_variable) LIKE lower({like})
-    ORDER BY codigo_variable
-    LIMIT 30
-    """
-
-    return {
-        "exacto": run_sql(exact_sql),
-        "sugerencias": run_sql(suggestions_sql),
-    }
+    return run_sql(sql)
 
 
 # -----------------------------------------------------------------------------
@@ -608,27 +298,6 @@ def find_column_case_insensitive(columns: Iterable[str], wanted: str) -> str | N
     return None
 
 
-@st.cache_resource(show_spinner=False)
-def download_remote_parquet(url: str) -> str:
-    """Descarga un Parquet remoto a /tmp para que GeoPandas/PyArrow no dependan de HTTPS FS."""
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    filename = hashlib.sha1(url.encode("utf-8")).hexdigest() + ".parquet"
-    path = CACHE_DIR / filename
-    tmp_path = CACHE_DIR / (filename + ".tmp")
-
-    if path.exists() and path.stat().st_size > 0:
-        return str(path)
-
-    with requests.get(url, stream=True, timeout=(15, 300)) as response:
-        response.raise_for_status()
-        with open(tmp_path, "wb") as fh:
-            for chunk in response.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    fh.write(chunk)
-    tmp_path.replace(path)
-    return str(path)
-
-
 @st.cache_data(show_spinner=True, ttl=60 * 60)
 def load_radios_geoparquet(year: int, provincia_code: str | None, departamento_code: str | None):
     if gpd is None:
@@ -637,34 +306,34 @@ def load_radios_geoparquet(year: int, provincia_code: str | None, departamento_c
         )
 
     url = source_url(year, "radios")
-    local_path = download_remote_parquet(url)
     join_col = JOIN_COL_BY_YEAR[year]
 
+    # Intentamos leer sólo la provincia/departamento elegido usando filtros parquet.
+    # Si el tipo de dato del filtro no coincide, caemos a lectura completa y filtrado local.
     filters = []
     if provincia_code and provincia_code != "__ALL__":
-        filters.append(("PROV", "=", str(provincia_code).zfill(2)))
+        filters.append(("PROV", "=", str(provincia_code)))
     if departamento_code and departamento_code != "__ALL__":
-        filters.append(("DEPTO", "=", str(departamento_code).zfill(3)))
+        filters.append(("DEPTO", "=", str(departamento_code)))
 
     columns = [join_col, "PROV", "DEPTO", "geometry"]
 
     try:
         if filters:
-            gdf = gpd.read_parquet(local_path, columns=columns, filters=filters)
+            gdf = gpd.read_parquet(url, columns=columns, filters=filters)
         else:
-            gdf = gpd.read_parquet(local_path, columns=columns)
+            gdf = gpd.read_parquet(url, columns=columns)
     except Exception:
-        # Fallback: lectura completa local. No volvemos a pedir el archivo por HTTPS.
-        gdf = gpd.read_parquet(local_path)
+        gdf = gpd.read_parquet(url)
 
     join_col_actual = find_column_case_insensitive(gdf.columns, join_col)
     if join_col_actual is None:
         raise RuntimeError(f"No encontré la columna de join {join_col} en radios.parquet")
 
     if provincia_code and provincia_code != "__ALL__" and "PROV" in gdf.columns:
-        gdf = gdf[gdf["PROV"].astype(str).str.zfill(2) == str(provincia_code).zfill(2)]
+        gdf = gdf[gdf["PROV"].astype(str) == str(provincia_code)]
     if departamento_code and departamento_code != "__ALL__" and "DEPTO" in gdf.columns:
-        gdf = gdf[gdf["DEPTO"].astype(str).str.zfill(3) == str(departamento_code).zfill(3)]
+        gdf = gdf[gdf["DEPTO"].astype(str) == str(departamento_code)]
 
     if join_col_actual != join_col:
         gdf = gdf.rename(columns={join_col_actual: join_col})
@@ -695,16 +364,17 @@ def build_choropleth_map(gdf, year: int, value_col: str = "conteo", simplify_tol
     denom = max(max_val - min_val, 1.0)
     gdf["_norm"] = ((gdf[value_col] - min_val) / denom).clip(0, 1)
 
+    # Escala simple: valores altos más intensos. Se guarda como propiedad GeoJSON.
     gdf["fill_color"] = gdf["_norm"].apply(
         lambda x: [int(60 + 160 * x), int(130 - 70 * x), int(220 - 120 * x), 145]
     )
 
+    # Centro del mapa: centroides en WGS84.
     centroids = gdf.geometry.centroid
     latitude = float(centroids.y.mean())
     longitude = float(centroids.x.mean())
 
-    join_col = JOIN_COL_BY_YEAR[year]
-    geojson = json.loads(gdf[[join_col, value_col, "fill_color", "geometry"]].to_json())
+    geojson = json.loads(gdf[[JOIN_COL_BY_YEAR[year], value_col, "fill_color", "geometry"]].to_json())
 
     layer = pdk.Layer(
         "GeoJsonLayer",
@@ -725,7 +395,7 @@ def build_choropleth_map(gdf, year: int, value_col: str = "conteo", simplify_tol
     )
 
     tooltip = {
-        "html": "<b>Radio:</b> {" + join_col + "}<br/><b>Conteo:</b> {conteo}",
+        "html": "<b>Radio:</b> {" + JOIN_COL_BY_YEAR[year] + "}<br/><b>Conteo:</b> {conteo}",
         "style": {"backgroundColor": "white", "color": "black"},
     }
 
@@ -747,49 +417,56 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Variable")
-    variable_search = st.text_input(
-        "Buscar variable",
-        value="pob",
-        help="Busca sobre las variables presentes en census-data.parquet. También incluye POB_TOT_P/VIV_TOT_P desde radios.parquet.",
+    variable_search = st.text_input("Buscar en metadata", value="poblacion")
+
+    metadata = get_metadata(year_selected)
+    metadata_filtered = metadata.copy()
+    if variable_search.strip():
+        term = variable_search.lower().strip()
+        metadata_filtered = metadata_filtered[
+            metadata_filtered.astype(str)
+            .apply(lambda col: col.str.lower().str.contains(term, na=False, regex=False), axis=0)
+            .any(axis=1)
+        ].copy()
+
+    code_col = infer_col(
+        metadata,
+        candidates=["codigo_variable", "cod_variable", "variable", "var", "code"],
+        contains_any=["codigo", "variable"],
+    )
+    label_col = infer_col(
+        metadata,
+        candidates=["etiqueta_variable", "descripcion", "label", "pregunta"],
+        contains_any=["etiqueta", "variable"],
     )
 
-    variables_df = get_census_variables(year_selected, variable_search, limit=500)
-    if variables_df.empty:
-        st.warning("No encontré variables con esa búsqueda. Probá con otro término o escribí el código exacto abajo.")
-
     variable_options = []
-    for _, row in variables_df.iterrows():
-        code = str(row["codigo_variable"])
-        label = str(row.get("etiqueta_variable", "")) if pd.notna(row.get("etiqueta_variable", "")) else ""
-        source = str(row.get("fuente", ""))
-        shown = f"{code} · {label}" if label else code
-        if source:
-            shown = f"{shown} [{source}]"
-        variable_options.append((code, shown))
+    if code_col and not metadata_filtered.empty:
+        tmp = metadata_filtered[[c for c in [code_col, label_col] if c]].drop_duplicates().head(500)
+        for _, row in tmp.iterrows():
+            code = str(row[code_col])
+            label = str(row[label_col]) if label_col and pd.notna(row[label_col]) else ""
+            variable_options.append((code, f"{code} · {label}" if label else code))
 
-    if not variable_options:
-        variable_options = [("POB_TOT_P", "POB_TOT_P · Población total [radios.parquet]")]
+    # Hints útiles si la metadata no permite inferir columnas.
+    for hint in DEFAULT_VARIABLE_HINTS:
+        if hint not in [v[0] for v in variable_options]:
+            variable_options.insert(0, (hint, hint))
 
     variable_label_to_code = {label: code for code, label in variable_options}
     selected_variable_label = st.selectbox(
         "Variable censal",
         list(variable_label_to_code.keys()),
-        index=0,
+        index=0 if variable_label_to_code else None,
     )
     variable_selected = variable_label_to_code.get(selected_variable_label, "POB_TOT_P")
 
-    use_manual_variable = st.checkbox(
-        "Escribir código manualmente",
-        value=False,
-        help="Activá esto solo si querés forzar un código que no aparece en el desplegable.",
+    manual_variable = st.text_input(
+        "O escribir código exacto",
+        value=variable_selected,
+        help="Ejemplo frecuente: POB_TOT_P. Podés copiar códigos desde la tabla de metadata.",
     )
-    if use_manual_variable:
-        manual_variable = st.text_input(
-            "Código exacto",
-            value=variable_selected,
-            help="Ejemplo: POB_TOT_P",
-        )
-        variable_selected = manual_variable.strip() or variable_selected
+    variable_selected = manual_variable.strip() or variable_selected
 
     st.divider()
     st.subheader("Geografía")
@@ -825,11 +502,11 @@ with st.sidebar:
     categoria_value = cat_options[selected_cat_label]
 
     st.divider()
-    group_options = list(GROUP_MAP_LONG.keys())
-    group_selected = st.selectbox("Agrupar por", group_options, index=1)
+    group_selected = st.selectbox("Agrupar por", list(GROUP_MAP.keys()), index=1)
     limit_rows = st.slider("Máximo de filas", min_value=10, max_value=5000, value=500, step=10)
 
 
+# Panel principal
 col_a, col_b, col_c, col_d = st.columns(4)
 col_a.metric("Año", str(year_selected))
 col_b.metric("Variable", variable_selected)
@@ -837,7 +514,7 @@ col_c.metric("Provincia", "Todas" if provincia_code == "__ALL__" else selected_p
 col_d.metric("Agrupación", group_selected)
 
 try:
-    df_result, query_source = query_censo_resilient(
+    df_result = query_censo(
         year=year_selected,
         variable=variable_selected,
         provincia_code=provincia_code,
@@ -853,80 +530,56 @@ except Exception as exc:
 
 if df_result.empty:
     st.warning("La consulta no devolvió resultados. Revisá el código de variable o los filtros.")
-    st.info(
-        "Tip: el selector ahora lista variables que existen en census-data.parquet. "
-        "Para población total o viviendas totales, usá POB_TOT_P o VIV_TOT_P, que pueden venir desde radios.parquet."
-    )
-    try:
-        diag = diagnose_query(
-            year_selected,
-            variable_selected,
-            provincia_code,
-            departamento_code,
-            categoria_value,
-        )
-        st.subheader("Diagnóstico")
-        st.write("Chequeo exacto en census-data.parquet")
-        st.dataframe(diag["exacto"], use_container_width=True)
-        if not diag["sugerencias"].empty:
-            st.write("Variables parecidas presentes en census-data.parquet")
-            st.dataframe(diag["sugerencias"], use_container_width=True)
-    except Exception as exc:
-        st.caption(f"No pude generar diagnóstico automático: {exc}")
 else:
     total = float(df_result["conteo"].sum())
-    col_total, col_source = st.columns([1, 2])
-    col_total.metric("Total según consulta", format_number(total))
-    col_source.info(f"Fuente usada para esta consulta: {query_source}")
+    st.metric("Total según consulta", f"{total:,.0f}".replace(",", "."))
 
     tab_resumen, tab_metadata, tab_mapa, tab_sql = st.tabs(
         ["Resumen", "Metadata", "Mapa", "SQL avanzado"]
     )
 
     with tab_resumen:
-        st.subheader("Resultado agregado")
-        st.dataframe(df_result, use_container_width=True, hide_index=True)
+        st.subheader("Resultados")
+        st.dataframe(df_result, use_container_width=True, height=420)
 
-        csv = df_result.to_csv(index=False).encode("utf-8-sig")
+        csv_bytes = df_result.to_csv(index=False).encode("utf-8-sig")
         st.download_button(
-            "Descargar CSV",
-            data=csv,
-            file_name=f"censo_{year_selected}_{variable_selected}_{group_selected}.csv".replace(" ", "_"),
+            label="Descargar CSV",
+            data=csv_bytes,
+            file_name=f"censo_{year_selected}_{variable_selected}_{group_selected.lower().replace(' ', '_')}.csv",
             mime="text/csv",
         )
 
-        chart_df = df_result.copy().head(30)
+        # Gráfico de barras para agregaciones con etiqueta legible.
         label_candidates = [
             "etiqueta_departamento",
             "etiqueta_provincia",
             "etiqueta_categoria",
             "id_geo",
-            "valor_departamento",
-            "valor_provincia",
+            "codigo_variable",
         ]
-        label_col = next((c for c in label_candidates if c in chart_df.columns), None)
-        if label_col:
+        label_col_chart = next((c for c in label_candidates if c in df_result.columns), None)
+        if label_col_chart:
+            top_n = st.slider("Top N para gráfico", 5, min(50, max(5, len(df_result))), 20)
+            chart_df = df_result.nlargest(top_n, "conteo").copy()
             chart = (
                 alt.Chart(chart_df)
                 .mark_bar()
                 .encode(
                     x=alt.X("conteo:Q", title="Conteo"),
-                    y=alt.Y(f"{label_col}:N", sort="-x", title=""),
+                    y=alt.Y(f"{label_col_chart}:N", sort="-x", title=""),
                     tooltip=list(chart_df.columns),
                 )
-                .properties(height=max(300, min(900, 24 * len(chart_df))))
+                .properties(height=max(280, top_n * 22))
             )
             st.altair_chart(chart, use_container_width=True)
 
     with tab_metadata:
-        st.subheader("Variables disponibles")
-        st.caption("Esta tabla está basada en los códigos presentes en census-data.parquet y enriquecida con metadata.parquet.")
-        st.dataframe(variables_df, use_container_width=True, hide_index=True)
+        st.subheader("Metadata de variables")
+        st.caption("Usá esta tabla para buscar códigos de variables y categorías disponibles.")
+        st.dataframe(metadata_filtered.head(1000), use_container_width=True, height=500)
 
-        with st.expander("Ver metadata completa"):
-            st.dataframe(get_metadata(year_selected), use_container_width=True)
-
-        with st.expander("Ver esquemas de archivos"):
+        with st.expander("Esquemas de archivos remotos"):
             schema_table = st.selectbox("Archivo", ["census", "metadata", "radios"])
             st.dataframe(get_schema(year_selected, schema_table), use_container_width=True)
 
@@ -942,8 +595,6 @@ else:
             )
         elif provincia_code == "__ALL__":
             st.info("Seleccioná una provincia para generar el mapa sin cargar todo el país.")
-        elif group_selected == "Categoría" and variable_selected in RADIOS_NUMERIC_VARIABLES:
-            st.info("Las variables provenientes de radios.parquet no tienen categorías. Cambiá la agrupación para mapear.")
         else:
             simplify_tolerance = st.slider(
                 "Simplificación geométrica",
@@ -956,72 +607,79 @@ else:
             if st.button("Generar mapa", type="primary"):
                 try:
                     with st.spinner("Consultando radios y geometrías..."):
-                        radio_counts, radio_source = query_radio_counts(
+                        radio_counts = query_radio_counts(
                             year_selected,
                             variable_selected,
                             provincia_code,
                             departamento_code,
                             categoria_value,
                         )
-                        if radio_counts.empty:
-                            st.warning("No hay datos a nivel radio para mapear con esos filtros.")
-                            st.stop()
-
                         join_col = JOIN_COL_BY_YEAR[year_selected]
                         gdf = load_radios_geoparquet(year_selected, provincia_code, departamento_code)
                         radio_counts["id_geo"] = radio_counts["id_geo"].astype(str)
                         gdf[join_col] = gdf[join_col].astype(str)
-                        gdf_plot = gdf.merge(
-                            radio_counts,
-                            left_on=join_col,
-                            right_on="id_geo",
-                            how="inner",
-                        )
+                        gdf = gdf.merge(radio_counts, left_on=join_col, right_on="id_geo", how="inner")
 
-                    if gdf_plot.empty:
-                        st.warning("El join entre radios y datos censales quedó vacío.")
+                    if gdf.empty:
+                        st.warning("No hubo geometrías para los filtros elegidos.")
                     else:
-                        st.caption(f"Fuente del mapa: {radio_source}")
-                        deck = build_choropleth_map(
-                            gdf_plot,
-                            year=year_selected,
-                            value_col="conteo",
-                            simplify_tolerance=simplify_tolerance,
-                        )
-                        st.pydeck_chart(deck, use_container_width=True)
-                        st.caption(f"Radios mapeados: {len(gdf_plot):,}".replace(",", "."))
+                        st.write(f"Radios en mapa: {len(gdf):,}".replace(",", "."))
+                        if len(gdf) > 30000:
+                            st.warning(
+                                "El mapa tiene muchos radios. Puede tardar o quedar pesado; filtrá un departamento para trabajar mejor."
+                            )
+                        deck = build_choropleth_map(gdf, year_selected, simplify_tolerance=simplify_tolerance)
+                        if deck:
+                            st.pydeck_chart(deck, use_container_width=True)
                 except Exception as exc:
                     st.error("No pude generar el mapa.")
                     st.exception(exc)
 
     with tab_sql:
         st.subheader("SQL avanzado")
-        st.caption(
-            "Podés consultar los Parquet remotos directamente. Alias sugeridos: census-data, metadata y radios."
-        )
-        if variable_selected in RADIOS_NUMERIC_VARIABLES and (categoria_value == "__ALL__"):
-            default_sql = f"""
-SELECT
-    PROV,
-    DEPTO,
-    {JOIN_COL_BY_YEAR[year_selected]} AS id_geo,
-    {variable_selected} AS conteo
-FROM read_parquet('{source_url(year_selected, 'radios')}')
-WHERE {build_where_radios(provincia_code, departamento_code)}
-LIMIT 20
-""".strip()
-        else:
-            default_sql = f"""
+        st.caption("Podés consultar directamente los Parquet remotos. Usá las URLs de abajo como referencia.")
+        st.code(
+            f"""
+-- Datos censales
 SELECT *
 FROM read_parquet('{source_url(year_selected, 'census')}')
+LIMIT 10;
+
+-- Metadata
+SELECT *
+FROM read_parquet('{source_url(year_selected, 'metadata')}')
+LIMIT 10;
+
+-- Radios censales / geometrías
+SELECT *
+FROM read_parquet('{source_url(year_selected, 'radios')}')
+LIMIT 10;
+""".strip(),
+            language="sql",
+        )
+
+        default_sql = f"""
+SELECT
+    etiqueta_departamento,
+    SUM(conteo) AS total
+FROM read_parquet('{source_url(year_selected, 'census')}')
 WHERE codigo_variable = '{variable_selected}'
-  AND {build_where_long(provincia_code=provincia_code, departamento_code=departamento_code, categoria_value=categoria_value)}
-LIMIT 20
+  AND valor_provincia = '{provincia_code}'
+GROUP BY 1
+ORDER BY total DESC
+LIMIT 50
 """.strip()
-        sql_custom = st.text_area("Consulta DuckDB", value=default_sql, height=180)
+        user_sql = st.text_area("Consulta SQL", value=default_sql, height=220)
         if st.button("Ejecutar SQL"):
             try:
-                st.dataframe(run_sql(sql_custom), use_container_width=True)
+                custom_df = run_sql(user_sql)
+                st.dataframe(custom_df, use_container_width=True, height=420)
+                st.download_button(
+                    "Descargar resultado SQL",
+                    custom_df.to_csv(index=False).encode("utf-8-sig"),
+                    file_name="consulta_sql_censo.csv",
+                    mime="text/csv",
+                )
             except Exception as exc:
                 st.error("Error ejecutando SQL.")
                 st.exception(exc)
