@@ -19,6 +19,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+
+import numpy as np
 from typing import Iterable
 
 import altair as alt
@@ -66,6 +68,37 @@ RADIOS_NUMERIC_VARIABLES = {
     "POB_TOT_P": "Población total",
     "VIV_TOT_P": "Viviendas totales",
 }
+
+# Catálogo mínimo de provincias como fallback local.
+# Los nombres de departamentos se intentan resolver primero con GeoRef.
+PROVINCE_NAMES = {
+    "02": "Ciudad Autónoma de Buenos Aires",
+    "06": "Buenos Aires",
+    "10": "Catamarca",
+    "14": "Córdoba",
+    "18": "Corrientes",
+    "22": "Chaco",
+    "26": "Chubut",
+    "30": "Entre Ríos",
+    "34": "Formosa",
+    "38": "Jujuy",
+    "42": "La Pampa",
+    "46": "La Rioja",
+    "50": "Mendoza",
+    "54": "Misiones",
+    "58": "Neuquén",
+    "62": "Río Negro",
+    "66": "Salta",
+    "70": "San Juan",
+    "74": "San Luis",
+    "78": "Santa Cruz",
+    "82": "Santa Fe",
+    "86": "Santiago del Estero",
+    "90": "Tucumán",
+    "94": "Tierra del Fuego, Antártida e Islas del Atlántico Sur",
+}
+
+GEOREF_API_BASE = "https://apis.datos.gob.ar/georef/api"
 
 GROUP_MAP_LONG = {
     "Provincia": ["valor_provincia", "etiqueta_provincia"],
@@ -159,13 +192,10 @@ def build_where_radios(provincia_code: str | None = None, departamento_code: str
     filters: list[str] = []
 
     if provincia_code and provincia_code != "__ALL__":
-        # Se normaliza con LPAD para tolerar códigos con/sin cero a la izquierda.
-        filters.append(f"LPAD(CAST(PROV AS VARCHAR), 2, '0') = LPAD({sql_quote(provincia_code)}, 2, '0')")
+        filters.append(f"{sql_norm_code('PROV', 2)} = LPAD({sql_quote(provincia_code)}, 2, '0')")
 
     if departamento_code and departamento_code != "__ALL__":
-        filters.append(
-            f"LPAD(CAST(DEPTO AS VARCHAR), 3, '0') = LPAD({sql_quote(departamento_code)}, 3, '0')"
-        )
+        filters.append(f"{sql_norm_code('DEPTO', 3)} = LPAD({sql_quote(departamento_code)}, 3, '0')")
 
     return " AND ".join(filters) if filters else "1 = 1"
 
@@ -188,6 +218,138 @@ def format_number(value: float | int | None) -> str:
     if value is None or pd.isna(value):
         return "-"
     return f"{float(value):,.0f}".replace(",", ".")
+
+
+def normalize_code_series(series: pd.Series, width: int) -> pd.Series:
+    """Normaliza códigos geográficos que pueden venir como int, string o float serializado."""
+    numeric = pd.to_numeric(series, errors="coerce")
+    numeric_text = numeric.astype("Int64").astype(str).replace("<NA>", pd.NA)
+    text = (
+        series.astype(str)
+        .str.strip()
+        .str.replace(r"\.0$", "", regex=True)
+        .replace({"nan": pd.NA, "None": pd.NA, "": pd.NA})
+    )
+    out = numeric_text.fillna(text).fillna("")
+    return out.astype(str).str.zfill(width)
+
+
+def sql_norm_code(col: str, width: int) -> str:
+    """Expresión DuckDB para normalizar códigos geográficos con/sin ceros a la izquierda."""
+    return (
+        f"CASE "
+        f"WHEN TRY_CAST({col} AS BIGINT) IS NOT NULL "
+        f"THEN LPAD(CAST(TRY_CAST({col} AS BIGINT) AS VARCHAR), {int(width)}, '0') "
+        f"ELSE LPAD(CAST({col} AS VARCHAR), {int(width)}, '0') "
+        f"END"
+    )
+
+
+def get_label_column(df: pd.DataFrame) -> str | None:
+    candidates = [
+        "etiqueta_departamento",
+        "etiqueta_provincia",
+        "etiqueta_categoria",
+        "id_geo",
+        "valor_departamento",
+        "valor_provincia",
+    ]
+    return next((c for c in candidates if c in df.columns), None)
+
+
+def enrich_result(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "conteo" not in df.columns:
+        return df.copy()
+    out = df.copy()
+    out["conteo"] = pd.to_numeric(out["conteo"], errors="coerce").fillna(0)
+    out = out.sort_values("conteo", ascending=False).reset_index(drop=True)
+    total = out["conteo"].sum()
+    out["ranking"] = np.arange(1, len(out) + 1)
+    out["pct_total"] = np.where(total > 0, out["conteo"] / total, 0)
+    out["conteo_acum"] = out["conteo"].cumsum()
+    out["pct_acum"] = np.where(total > 0, out["conteo_acum"] / total, 0)
+    return out
+
+
+def build_bar_chart(df: pd.DataFrame, label_col: str, top_n: int):
+    chart_df = enrich_result(df).head(int(top_n))
+    return (
+        alt.Chart(chart_df)
+        .mark_bar()
+        .encode(
+            x=alt.X("conteo:Q", title="Valor"),
+            y=alt.Y(f"{label_col}:N", sort="-x", title=""),
+            tooltip=[c for c in chart_df.columns if c != "conteo_acum"],
+        )
+        .properties(height=max(300, min(850, 24 * len(chart_df))))
+    )
+
+
+def build_pareto_chart(df: pd.DataFrame, label_col: str, top_n: int):
+    chart_df = enrich_result(df).head(int(top_n))
+    base = alt.Chart(chart_df).encode(x=alt.X(f"{label_col}:N", sort="-y", title=""))
+    bars = base.mark_bar(opacity=0.75).encode(
+        y=alt.Y("conteo:Q", title="Valor"),
+        tooltip=[label_col, "conteo", alt.Tooltip("pct_total:Q", format=".1%"), alt.Tooltip("pct_acum:Q", format=".1%")],
+    )
+    line = base.mark_line(point=True).encode(
+        y=alt.Y("pct_acum:Q", title="% acumulado", axis=alt.Axis(format="%")),
+        tooltip=[label_col, alt.Tooltip("pct_acum:Q", format=".1%")],
+    )
+    return (bars + line).resolve_scale(y="independent").properties(height=420)
+
+
+def build_distribution_chart(df: pd.DataFrame):
+    chart_df = enrich_result(df)
+    return (
+        alt.Chart(chart_df)
+        .mark_bar()
+        .encode(
+            x=alt.X("conteo:Q", bin=alt.Bin(maxbins=35), title="Valor"),
+            y=alt.Y("count():Q", title="Cantidad de áreas"),
+            tooltip=[alt.Tooltip("count():Q", title="Áreas")],
+        )
+        .properties(height=360)
+    )
+
+
+def build_share_chart(df: pd.DataFrame, label_col: str, top_n: int):
+    chart_df = enrich_result(df).head(int(top_n)).copy()
+    chart_df["pct_label"] = chart_df["pct_total"]
+    return (
+        alt.Chart(chart_df)
+        .mark_bar()
+        .encode(
+            x=alt.X("pct_label:Q", title="Participación", axis=alt.Axis(format="%")),
+            y=alt.Y(f"{label_col}:N", sort="-x", title=""),
+            tooltip=[label_col, "conteo", alt.Tooltip("pct_total:Q", format=".1%")],
+        )
+        .properties(height=max(300, min(850, 24 * len(chart_df))))
+    )
+
+
+def summarize_result(df: pd.DataFrame, label_col: str | None) -> dict[str, object]:
+    enriched = enrich_result(df)
+    if enriched.empty or "conteo" not in enriched.columns:
+        return {
+            "total": 0,
+            "n_areas": 0,
+            "top_label": "-",
+            "top_value": 0,
+            "top_share": 0,
+            "mean_value": 0,
+            "median_value": 0,
+        }
+    top_row = enriched.iloc[0]
+    return {
+        "total": float(enriched["conteo"].sum()),
+        "n_areas": int(len(enriched)),
+        "top_label": str(top_row[label_col]) if label_col and label_col in enriched.columns else "Top 1",
+        "top_value": float(top_row["conteo"]),
+        "top_share": float(top_row["pct_total"]),
+        "mean_value": float(enriched["conteo"].mean()),
+        "median_value": float(enriched["conteo"].median()),
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -268,35 +430,128 @@ def get_census_variables(year: int, search: str | None = None, limit: int = 500)
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60)
+def get_georef_provincias() -> pd.DataFrame:
+    """Catálogo de provincias desde GeoRef, con fallback local."""
+    try:
+        resp = requests.get(
+            f"{GEOREF_API_BASE}/provincias",
+            params={"campos": "id,nombre", "max": 100},
+            timeout=12,
+        )
+        resp.raise_for_status()
+        rows = resp.json().get("provincias", [])
+        df = pd.DataFrame(rows)
+        if not df.empty and {"id", "nombre"}.issubset(df.columns):
+            df["valor_provincia"] = df["id"].astype(str).str.zfill(2)
+            df["etiqueta_provincia"] = df["nombre"].astype(str).str.title()
+            return df[["valor_provincia", "etiqueta_provincia"]].drop_duplicates()
+    except Exception:
+        pass
+
+    return pd.DataFrame(
+        [
+            {"valor_provincia": code, "etiqueta_provincia": name}
+            for code, name in PROVINCE_NAMES.items()
+        ]
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60)
+def get_georef_departamentos(provincia_code: str | None) -> pd.DataFrame:
+    """Departamentos oficiales desde GeoRef. Devuelve DEPTO de 3 dígitos para cruzar con radios.parquet."""
+    if not provincia_code or provincia_code == "__ALL__":
+        return pd.DataFrame(columns=["prov_norm", "depto_norm", "valor_departamento", "etiqueta_departamento"])
+
+    prov_norm = str(provincia_code).zfill(2)
+    try:
+        resp = requests.get(
+            f"{GEOREF_API_BASE}/departamentos",
+            params={"provincia": prov_norm, "campos": "id,nombre,provincia", "max": 1000},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        rows = resp.json().get("departamentos", [])
+        df = pd.DataFrame(rows)
+        if not df.empty and {"id", "nombre"}.issubset(df.columns):
+            df["id"] = df["id"].astype(str).str.zfill(5)
+            df["prov_norm"] = df["id"].str[:2]
+            df["depto_norm"] = df["id"].str[-3:]
+            df["valor_departamento"] = df["depto_norm"]
+            df["etiqueta_departamento"] = df["nombre"].astype(str).str.title()
+            return df[["prov_norm", "depto_norm", "valor_departamento", "etiqueta_departamento"]].drop_duplicates()
+    except Exception:
+        pass
+
+    return pd.DataFrame(columns=["prov_norm", "depto_norm", "valor_departamento", "etiqueta_departamento"])
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60)
 def get_provincias(year: int) -> pd.DataFrame:
-    url = source_url(year, "census")
-    sql = f"""
-    SELECT DISTINCT
-        valor_provincia,
-        etiqueta_provincia
-    FROM read_parquet({sql_quote(url)})
-    WHERE valor_provincia IS NOT NULL
-      AND etiqueta_provincia IS NOT NULL
-    ORDER BY etiqueta_provincia
-    """
-    return run_sql(sql)
+    """Provincias presentes en radios.parquet, enriquecidas con nombres de GeoRef/fallback."""
+    radios_url = source_url(year, "radios")
+    try:
+        codes = run_sql(
+            f"""
+            SELECT DISTINCT {sql_norm_code('PROV', 2)} AS valor_provincia
+            FROM read_parquet({sql_quote(radios_url)})
+            WHERE PROV IS NOT NULL
+            ORDER BY 1
+            """
+        )
+    except Exception:
+        codes = pd.DataFrame({"valor_provincia": list(PROVINCE_NAMES.keys())})
+
+    names = get_georef_provincias()
+    out = codes.merge(names, on="valor_provincia", how="left")
+    out["etiqueta_provincia"] = out["etiqueta_provincia"].fillna(
+        out["valor_provincia"].map(PROVINCE_NAMES)
+    )
+    out["etiqueta_provincia"] = out["etiqueta_provincia"].fillna("Provincia " + out["valor_provincia"].astype(str))
+    return out[["valor_provincia", "etiqueta_provincia"]].drop_duplicates().sort_values("etiqueta_provincia")
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60)
 def get_departamentos(year: int, provincia_code: str | None) -> pd.DataFrame:
-    url = source_url(year, "census")
-    where = build_where_long(provincia_code=provincia_code)
-    sql = f"""
-    SELECT DISTINCT
-        valor_departamento,
-        etiqueta_departamento
-    FROM read_parquet({sql_quote(url)})
-    WHERE {where}
-      AND valor_departamento IS NOT NULL
-      AND etiqueta_departamento IS NOT NULL
-    ORDER BY etiqueta_departamento
-    """
-    return run_sql(sql)
+    """Departamentos presentes en radios.parquet, con nombres de GeoRef cuando están disponibles."""
+    if not provincia_code or provincia_code == "__ALL__":
+        return pd.DataFrame(columns=["valor_departamento", "etiqueta_departamento"])
+
+    radios_url = source_url(year, "radios")
+    where = build_where_radios(provincia_code=provincia_code)
+    try:
+        codes = run_sql(
+            f"""
+            SELECT DISTINCT
+                {sql_norm_code('PROV', 2)} AS prov_norm,
+                {sql_norm_code('DEPTO', 3)} AS depto_norm
+            FROM read_parquet({sql_quote(radios_url)})
+            WHERE {where}
+              AND DEPTO IS NOT NULL
+            ORDER BY 1, 2
+            """
+        )
+    except Exception:
+        codes = pd.DataFrame(columns=["prov_norm", "depto_norm"])
+
+    georef = get_georef_departamentos(provincia_code)
+    if codes.empty:
+        out = georef.copy()
+    else:
+        out = codes.merge(georef, on=["prov_norm", "depto_norm"], how="left")
+
+    if out.empty:
+        return pd.DataFrame(columns=["valor_departamento", "etiqueta_departamento"])
+
+    out["valor_departamento"] = out.get("valor_departamento", out["depto_norm"]).fillna(out["depto_norm"])
+    out["etiqueta_departamento"] = out.get("etiqueta_departamento", pd.Series(index=out.index, dtype=str))
+    out["etiqueta_departamento"] = out["etiqueta_departamento"].fillna("Departamento " + out["depto_norm"].astype(str))
+
+    return (
+        out[["valor_departamento", "etiqueta_departamento"]]
+        .drop_duplicates()
+        .sort_values("etiqueta_departamento")
+        .reset_index(drop=True)
+    )
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60)
@@ -305,10 +560,10 @@ def get_geo_names(year: int) -> pd.DataFrame:
     url = source_url(year, "census")
     sql = f"""
     SELECT
-        LPAD(CAST(valor_provincia AS VARCHAR), 2, '0') AS prov_norm,
+        {sql_norm_code('valor_provincia', 2)} AS prov_norm,
         any_value(valor_provincia) AS valor_provincia,
         any_value(etiqueta_provincia) AS etiqueta_provincia,
-        LPAD(CAST(valor_departamento AS VARCHAR), 3, '0') AS depto_norm,
+        {sql_norm_code('valor_departamento', 3)} AS depto_norm,
         any_value(valor_departamento) AS valor_departamento,
         any_value(etiqueta_departamento) AS etiqueta_departamento
     FROM read_parquet({sql_quote(url)})
@@ -393,88 +648,67 @@ def query_censo_radios(
     group_label: str,
     limit: int,
 ) -> pd.DataFrame:
-    """Consulta variables que viven como columnas en radios.parquet, enriqueciendo nombres desde census-data."""
+    """Consulta variables que viven como columnas en radios.parquet y agrega nombres legibles con GeoRef."""
     if variable not in RADIOS_NUMERIC_VARIABLES:
         return pd.DataFrame()
     if group_label == "Categoría":
         return pd.DataFrame()
 
     radios_url = source_url(year, "radios")
-    census_url = source_url(year, "census")
     join_col = JOIN_COL_BY_YEAR[year]
     where = build_where_radios(provincia_code, departamento_code)
-
-    # geo_names evita mostrar solo códigos de departamento cuando consultamos radios.parquet.
-    geo_names_cte = f"""
-    geo_names AS (
-        SELECT
-            LPAD(CAST(valor_provincia AS VARCHAR), 2, '0') AS prov_norm,
-            any_value(valor_provincia) AS valor_provincia,
-            any_value(etiqueta_provincia) AS etiqueta_provincia,
-            LPAD(CAST(valor_departamento AS VARCHAR), 3, '0') AS depto_norm,
-            any_value(valor_departamento) AS valor_departamento,
-            any_value(etiqueta_departamento) AS etiqueta_departamento
-        FROM read_parquet({sql_quote(census_url)})
-        WHERE valor_provincia IS NOT NULL
-          AND etiqueta_provincia IS NOT NULL
-          AND valor_departamento IS NOT NULL
-          AND etiqueta_departamento IS NOT NULL
-        GROUP BY 1, 4
-    )
-    """
-
     limit_clause = f"LIMIT {int(limit)}" if limit else ""
 
     if group_label == "Provincia":
         sql = f"""
-        WITH r AS (
-            SELECT
-                LPAD(CAST(PROV AS VARCHAR), 2, '0') AS prov_norm,
-                SUM({variable}) AS conteo
-            FROM read_parquet({sql_quote(radios_url)})
-            WHERE {where}
-            GROUP BY 1
-        ), {geo_names_cte}
         SELECT
-            COALESCE(g.valor_provincia, r.prov_norm) AS valor_provincia,
-            COALESCE(g.etiqueta_provincia, r.prov_norm) AS etiqueta_provincia,
-            r.conteo
-        FROM r
-        LEFT JOIN (
-            SELECT prov_norm, any_value(valor_provincia) AS valor_provincia, any_value(etiqueta_provincia) AS etiqueta_provincia
-            FROM geo_names
-            GROUP BY 1
-        ) g USING (prov_norm)
+            {sql_norm_code('PROV', 2)} AS valor_provincia,
+            SUM({variable}) AS conteo
+        FROM read_parquet({sql_quote(radios_url)})
+        WHERE {where}
+        GROUP BY 1
         ORDER BY conteo DESC
         {limit_clause}
         """
-        return run_sql(sql)
+        df = run_sql(sql)
+        names = get_georef_provincias()
+        df = df.merge(names, on="valor_provincia", how="left")
+        df["etiqueta_provincia"] = df["etiqueta_provincia"].fillna(
+            df["valor_provincia"].map(PROVINCE_NAMES)
+        )
+        df["etiqueta_provincia"] = df["etiqueta_provincia"].fillna("Provincia " + df["valor_provincia"].astype(str))
+        return df[["valor_provincia", "etiqueta_provincia", "conteo"]]
 
     if group_label == "Departamento":
         sql = f"""
-        WITH r AS (
-            SELECT
-                LPAD(CAST(PROV AS VARCHAR), 2, '0') AS prov_norm,
-                LPAD(CAST(DEPTO AS VARCHAR), 3, '0') AS depto_norm,
-                SUM({variable}) AS conteo
-            FROM read_parquet({sql_quote(radios_url)})
-            WHERE {where}
-            GROUP BY 1, 2
-        ), {geo_names_cte}
         SELECT
-            COALESCE(g.valor_provincia, r.prov_norm) AS valor_provincia,
-            COALESCE(g.etiqueta_provincia, r.prov_norm) AS etiqueta_provincia,
-            COALESCE(g.valor_departamento, r.depto_norm) AS valor_departamento,
-            COALESCE(g.etiqueta_departamento, r.depto_norm) AS etiqueta_departamento,
-            r.conteo
-        FROM r
-        LEFT JOIN geo_names g
-          ON r.prov_norm = g.prov_norm
-         AND r.depto_norm = g.depto_norm
+            {sql_norm_code('PROV', 2)} AS prov_norm,
+            {sql_norm_code('DEPTO', 3)} AS depto_norm,
+            SUM({variable}) AS conteo
+        FROM read_parquet({sql_quote(radios_url)})
+        WHERE {where}
+        GROUP BY 1, 2
         ORDER BY conteo DESC
         {limit_clause}
         """
-        return run_sql(sql)
+        df = run_sql(sql)
+        prov_names = get_georef_provincias().rename(
+            columns={"valor_provincia": "prov_norm", "etiqueta_provincia": "etiqueta_provincia"}
+        )
+        dept_names = get_georef_departamentos(provincia_code)
+        df = df.merge(prov_names, on="prov_norm", how="left")
+        if not dept_names.empty:
+            df = df.merge(dept_names, on=["prov_norm", "depto_norm"], how="left")
+        else:
+            df["valor_departamento"] = df["depto_norm"]
+            df["etiqueta_departamento"] = None
+
+        df["valor_provincia"] = df["prov_norm"]
+        df["etiqueta_provincia"] = df["etiqueta_provincia"].fillna(df["prov_norm"].map(PROVINCE_NAMES))
+        df["etiqueta_provincia"] = df["etiqueta_provincia"].fillna("Provincia " + df["prov_norm"].astype(str))
+        df["valor_departamento"] = df["valor_departamento"].fillna(df["depto_norm"])
+        df["etiqueta_departamento"] = df["etiqueta_departamento"].fillna("Departamento " + df["depto_norm"].astype(str))
+        return df[["valor_provincia", "etiqueta_provincia", "valor_departamento", "etiqueta_departamento", "conteo"]]
 
     if group_label == "Radio censal":
         sql = f"""
@@ -676,9 +910,9 @@ def load_radios_geoparquet(year: int, provincia_code: str | None, departamento_c
         raise RuntimeError(f"No encontré la columna de join {join_col} en radios.parquet")
 
     if provincia_code and provincia_code != "__ALL__" and "PROV" in gdf.columns:
-        gdf = gdf[gdf["PROV"].astype(str).str.zfill(2) == str(provincia_code).zfill(2)]
+        gdf = gdf[normalize_code_series(gdf["PROV"], 2) == str(provincia_code).zfill(2)]
     if departamento_code and departamento_code != "__ALL__" and "DEPTO" in gdf.columns:
-        gdf = gdf[gdf["DEPTO"].astype(str).str.zfill(3) == str(departamento_code).zfill(3)]
+        gdf = gdf[normalize_code_series(gdf["DEPTO"], 3) == str(departamento_code).zfill(3)]
 
     if join_col_actual != join_col:
         gdf = gdf.rename(columns={join_col_actual: join_col})
@@ -687,12 +921,23 @@ def load_radios_geoparquet(year: int, provincia_code: str | None, departamento_c
     return gdf
 
 
-def build_choropleth_map(gdf, year: int, value_col: str = "conteo", simplify_tolerance: float = 0.0002):
+def build_choropleth_map(
+    gdf,
+    year: int,
+    value_col: str = "conteo",
+    simplify_tolerance: float = 0.0002,
+    metric_mode: str = "Valor total",
+    show_polygons: bool = True,
+    show_bubbles: bool = False,
+    show_labels: bool = False,
+    label_top_n: int = 20,
+    extruded: bool = False,
+):
     if pdk is None:
         raise RuntimeError("Falta pydeck. Instalá: pip install pydeck")
 
     if gdf.empty:
-        return None
+        return None, pd.DataFrame()
 
     gdf = gdf.copy()
 
@@ -701,49 +946,123 @@ def build_choropleth_map(gdf, year: int, value_col: str = "conteo", simplify_tol
     else:
         gdf = gdf.to_crs(4326)
 
+    # Métricas derivadas para capas temáticas.
+    area_geom = gdf.to_crs(3857).geometry.area / 1_000_000
+    gdf["area_km2"] = area_geom.replace(0, np.nan).fillna(0.000001)
+    gdf[value_col] = pd.to_numeric(gdf[value_col], errors="coerce").fillna(0)
+    gdf["valor_por_km2"] = gdf[value_col] / gdf["area_km2"]
+    gdf["log_valor"] = np.log1p(gdf[value_col])
+
+    if metric_mode == "Valor por km²":
+        metric_col = "valor_por_km2"
+        metric_title = "Valor por km²"
+    elif metric_mode == "Log(valor + 1)":
+        metric_col = "log_valor"
+        metric_title = "Log(valor + 1)"
+    else:
+        metric_col = value_col
+        metric_title = "Valor total"
+
     if simplify_tolerance and simplify_tolerance > 0:
         gdf["geometry"] = gdf.geometry.simplify(simplify_tolerance, preserve_topology=True)
 
-    min_val = float(gdf[value_col].min())
-    max_val = float(gdf[value_col].max())
+    min_val = float(gdf[metric_col].min())
+    max_val = float(gdf[metric_col].max())
     denom = max(max_val - min_val, 1.0)
-    gdf["_norm"] = ((gdf[value_col] - min_val) / denom).clip(0, 1)
+    gdf["_norm"] = ((gdf[metric_col] - min_val) / denom).clip(0, 1)
 
     gdf["fill_color"] = gdf["_norm"].apply(
-        lambda x: [int(60 + 160 * x), int(130 - 70 * x), int(220 - 120 * x), 145]
+        lambda x: [int(55 + 180 * x), int(120 - 70 * x), int(220 - 120 * x), 150]
     )
+    gdf["elevation"] = (gdf["_norm"] * 2500).fillna(0)
 
     centroids = gdf.geometry.centroid
-    latitude = float(centroids.y.mean())
-    longitude = float(centroids.x.mean())
+    gdf["lon"] = centroids.x
+    gdf["lat"] = centroids.y
+    gdf["radio_burbuja"] = (80 + 900 * np.sqrt(gdf["_norm"].clip(0, 1))).fillna(80)
+    gdf["label"] = gdf[value_col].round(0).astype("Int64").astype(str)
+
+    latitude = float(gdf["lat"].mean())
+    longitude = float(gdf["lon"].mean())
 
     join_col = JOIN_COL_BY_YEAR[year]
-    geojson = json.loads(gdf[[join_col, value_col, "fill_color", "geometry"]].to_json())
+    export_cols = [join_col, value_col, metric_col, "area_km2", "valor_por_km2", "fill_color", "elevation", "geometry"]
+    export_cols = [c for c in export_cols if c in gdf.columns]
+    geojson = json.loads(gdf[export_cols].to_json())
 
-    layer = pdk.Layer(
-        "GeoJsonLayer",
-        geojson,
-        pickable=True,
-        stroked=True,
-        filled=True,
-        get_fill_color="properties.fill_color",
-        get_line_color=[80, 80, 80, 80],
-        line_width_min_pixels=0.2,
-    )
+    layers = []
+    if show_polygons:
+        layers.append(
+            pdk.Layer(
+                "GeoJsonLayer",
+                geojson,
+                pickable=True,
+                stroked=True,
+                filled=True,
+                extruded=extruded,
+                get_fill_color="properties.fill_color",
+                get_elevation="properties.elevation",
+                get_line_color=[80, 80, 80, 80],
+                line_width_min_pixels=0.2,
+            )
+        )
+
+    point_cols = [join_col, value_col, metric_col, "area_km2", "valor_por_km2", "lon", "lat", "radio_burbuja", "label"]
+    point_cols = [c for c in point_cols if c in gdf.columns]
+    points_df = pd.DataFrame(gdf[point_cols].drop(columns=[], errors="ignore"))
+
+    if show_bubbles:
+        layers.append(
+            pdk.Layer(
+                "ScatterplotLayer",
+                points_df,
+                pickable=True,
+                get_position="[lon, lat]",
+                get_radius="radio_burbuja",
+                get_fill_color=[30, 90, 180, 130],
+                get_line_color=[20, 20, 20, 120],
+                line_width_min_pixels=1,
+            )
+        )
+
+    if show_labels:
+        labels_df = points_df.sort_values(value_col, ascending=False).head(int(label_top_n)).copy()
+        layers.append(
+            pdk.Layer(
+                "TextLayer",
+                labels_df,
+                pickable=False,
+                get_position="[lon, lat]",
+                get_text="label",
+                get_size=13,
+                get_color=[20, 20, 20, 230],
+                get_angle=0,
+                get_text_anchor="middle",
+                get_alignment_baseline="center",
+            )
+        )
 
     view_state = pdk.ViewState(
         latitude=latitude,
         longitude=longitude,
-        zoom=7 if len(gdf) < 5000 else 5,
-        pitch=0,
+        zoom=8 if len(gdf) < 1500 else 6,
+        pitch=35 if extruded else 0,
     )
 
     tooltip = {
-        "html": "<b>Radio:</b> {" + join_col + "}<br/><b>Conteo:</b> {conteo}",
+        "html": (
+            "<b>Radio:</b> {" + join_col + "}<br/>"
+            "<b>Valor:</b> {" + value_col + "}<br/>"
+            "<b>Km²:</b> {area_km2}<br/>"
+            "<b>Valor/km²:</b> {valor_por_km2}<br/>"
+            f"<b>Capa:</b> {metric_title}"
+        ),
         "style": {"backgroundColor": "white", "color": "black"},
     }
 
-    return pdk.Deck(layers=[layer], initial_view_state=view_state, tooltip=tooltip)
+    deck = pdk.Deck(layers=layers, initial_view_state=view_state, tooltip=tooltip)
+    map_summary = gdf[[join_col, value_col, "area_km2", "valor_por_km2", "lon", "lat"]].copy()
+    return deck, map_summary
 
 
 # -----------------------------------------------------------------------------
@@ -896,64 +1215,77 @@ if df_result.empty:
     except Exception as exc:
         st.caption(f"No pude generar diagnóstico automático: {exc}")
 else:
-    total = float(df_result["conteo"].sum())
+    df_enriched = enrich_result(df_result)
+    label_col = get_label_column(df_enriched)
+    summary = summarize_result(df_enriched, label_col)
+
     col_total, col_source = st.columns([1, 2])
-    col_total.metric("Total según consulta", format_number(total))
+    col_total.metric("Total según consulta", format_number(summary["total"]))
     col_source.info(f"Fuente usada para esta consulta: {query_source}")
 
-    tab_resumen, tab_metadata, tab_mapa, tab_sql = st.tabs(
-        ["Resumen", "Metadata", "Mapa", "SQL avanzado"]
+    tab_resumen, tab_graficos, tab_mapa, tab_metadata, tab_sql = st.tabs(
+        ["Resumen", "Gráficos", "Mapa y capas", "Metadata", "SQL avanzado"]
     )
 
     with tab_resumen:
-        st.subheader("Resultado agregado")
-        st.dataframe(df_result, use_container_width=True, hide_index=True)
+        st.subheader("Resumen ejecutivo")
+        kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+        kpi1.metric("Total", format_number(summary["total"]))
+        kpi2.metric("Áreas", format_number(summary["n_areas"]))
+        kpi3.metric("Promedio por área", format_number(summary["mean_value"]))
+        kpi4.metric("Mediana por área", format_number(summary["median_value"]))
 
-        csv = df_result.to_csv(index=False).encode("utf-8-sig")
+        st.caption(
+            f"Área con mayor valor: **{summary['top_label']}** "
+            f"con {format_number(summary['top_value'])} "
+            f"({summary['top_share']:.1%} del total)."
+        )
+
+        display_df = df_enriched.copy()
+        if "pct_total" in display_df.columns:
+            display_df["pct_total"] = display_df["pct_total"].map(lambda x: f"{x:.2%}")
+        if "pct_acum" in display_df.columns:
+            display_df["pct_acum"] = display_df["pct_acum"].map(lambda x: f"{x:.2%}")
+
+        st.subheader("Tabla enriquecida")
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+        csv = df_enriched.to_csv(index=False).encode("utf-8-sig")
         st.download_button(
-            "Descargar CSV",
+            "Descargar CSV enriquecido",
             data=csv,
             file_name=f"censo_{year_selected}_{variable_selected}_{group_selected}.csv".replace(" ", "_"),
             mime="text/csv",
         )
 
-        chart_df = df_result.copy().head(30)
-        label_candidates = [
-            "etiqueta_departamento",
-            "etiqueta_provincia",
-            "etiqueta_categoria",
-            "id_geo",
-            "valor_departamento",
-            "valor_provincia",
-        ]
-        label_col = next((c for c in label_candidates if c in chart_df.columns), None)
-        if label_col:
-            chart = (
-                alt.Chart(chart_df)
-                .mark_bar()
-                .encode(
-                    x=alt.X("conteo:Q", title="Conteo"),
-                    y=alt.Y(f"{label_col}:N", sort="-x", title=""),
-                    tooltip=list(chart_df.columns),
+    with tab_graficos:
+        st.subheader("Gráficos informativos")
+        if label_col is None:
+            st.info("No encontré una columna de etiqueta para graficar esta consulta.")
+        else:
+            top_n_chart = st.slider("Top N para gráficos", 5, 50, min(20, max(5, len(df_enriched))), 5)
+            chart_a, chart_b = st.columns(2)
+            with chart_a:
+                st.markdown("**Ranking de áreas**")
+                st.altair_chart(build_bar_chart(df_enriched, label_col, top_n_chart), use_container_width=True)
+            with chart_b:
+                st.markdown("**Participación sobre el total**")
+                st.altair_chart(build_share_chart(df_enriched, label_col, top_n_chart), use_container_width=True)
+
+            st.markdown("**Pareto: acumulado del top seleccionado**")
+            st.altair_chart(build_pareto_chart(df_enriched, label_col, top_n_chart), use_container_width=True)
+
+            st.markdown("**Distribución de valores entre áreas**")
+            st.altair_chart(build_distribution_chart(df_enriched), use_container_width=True)
+
+            with st.expander("Lectura rápida"):
+                st.write(
+                    "Este bloque ayuda a detectar concentración territorial: si pocas áreas explican un porcentaje alto del total, "
+                    "conviene revisar esas áreas en el mapa y eventualmente bajar a nivel radio censal."
                 )
-                .properties(height=max(300, min(900, 24 * len(chart_df))))
-            )
-            st.altair_chart(chart, use_container_width=True)
-
-    with tab_metadata:
-        st.subheader("Variables disponibles")
-        st.caption("Esta tabla está basada en los códigos presentes en census-data.parquet y enriquecida con metadata.parquet.")
-        st.dataframe(variables_df, use_container_width=True, hide_index=True)
-
-        with st.expander("Ver metadata completa"):
-            st.dataframe(get_metadata(year_selected), use_container_width=True)
-
-        with st.expander("Ver esquemas de archivos"):
-            schema_table = st.selectbox("Archivo", ["census", "metadata", "radios"])
-            st.dataframe(get_schema(year_selected, schema_table), use_container_width=True)
 
     with tab_mapa:
-        st.subheader("Mapa de radios censales")
+        st.subheader("Mapa de radios censales y capas")
         st.caption(
             "Para evitar tiempos de carga altos, conviene filtrar al menos una provincia y, si es Buenos Aires/CABA, idealmente un departamento/comuna."
         )
@@ -967,14 +1299,30 @@ else:
         elif group_selected == "Categoría" and variable_selected in RADIOS_NUMERIC_VARIABLES:
             st.info("Las variables provenientes de radios.parquet no tienen categorías. Cambiá la agrupación para mapear.")
         else:
-            simplify_tolerance = st.slider(
-                "Simplificación geométrica",
-                min_value=0.0,
-                max_value=0.002,
-                value=0.0002,
-                step=0.0001,
-                help="Valores más altos alivian el mapa, pero reducen detalle de polígonos.",
-            )
+            cfg1, cfg2, cfg3 = st.columns(3)
+            with cfg1:
+                metric_mode = st.selectbox(
+                    "Métrica de color",
+                    ["Valor total", "Valor por km²", "Log(valor + 1)"],
+                    index=0,
+                    help="Valor por km² sirve como aproximación de densidad para población/viviendas."
+                )
+                simplify_tolerance = st.slider(
+                    "Simplificación geométrica",
+                    min_value=0.0,
+                    max_value=0.004,
+                    value=0.0004,
+                    step=0.0001,
+                    help="Valores más altos alivian el mapa, pero reducen detalle de polígonos.",
+                )
+            with cfg2:
+                show_polygons = st.checkbox("Capa polígonos", value=True)
+                show_bubbles = st.checkbox("Capa burbujas", value=False)
+                show_labels = st.checkbox("Etiquetas top radios", value=False)
+            with cfg3:
+                extruded = st.checkbox("Vista 3D", value=False)
+                label_top_n = st.slider("Cantidad de etiquetas", 5, 100, 20, 5)
+
             if st.button("Generar mapa", type="primary"):
                 try:
                     with st.spinner("Consultando radios y geometrías..."):
@@ -1004,17 +1352,46 @@ else:
                         st.warning("El join entre radios y datos censales quedó vacío.")
                     else:
                         st.caption(f"Fuente del mapa: {radio_source}")
-                        deck = build_choropleth_map(
+                        deck, map_summary = build_choropleth_map(
                             gdf_plot,
                             year=year_selected,
                             value_col="conteo",
                             simplify_tolerance=simplify_tolerance,
+                            metric_mode=metric_mode,
+                            show_polygons=show_polygons,
+                            show_bubbles=show_bubbles,
+                            show_labels=show_labels,
+                            label_top_n=label_top_n,
+                            extruded=extruded,
                         )
                         st.pydeck_chart(deck, use_container_width=True)
-                        st.caption(f"Radios mapeados: {len(gdf_plot):,}".replace(",", "."))
+
+                        m1, m2, m3 = st.columns(3)
+                        m1.metric("Radios mapeados", format_number(len(gdf_plot)))
+                        m2.metric("Área aproximada km²", format_number(map_summary["area_km2"].sum()))
+                        m3.metric("Valor/km² promedio", format_number(map_summary["valor_por_km2"].mean()))
+
+                        with st.expander("Tabla de radios mapeados"):
+                            st.dataframe(
+                                map_summary.sort_values("conteo", ascending=False).head(1000),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
                 except Exception as exc:
                     st.error("No pude generar el mapa.")
                     st.exception(exc)
+
+    with tab_metadata:
+        st.subheader("Variables disponibles")
+        st.caption("Esta tabla está basada en los códigos presentes en census-data.parquet y enriquecida con metadata.parquet.")
+        st.dataframe(variables_df, use_container_width=True, hide_index=True)
+
+        with st.expander("Ver metadata completa"):
+            st.dataframe(get_metadata(year_selected), use_container_width=True)
+
+        with st.expander("Ver esquemas de archivos"):
+            schema_table = st.selectbox("Archivo", ["census", "metadata", "radios"])
+            st.dataframe(get_schema(year_selected, schema_table), use_container_width=True)
 
     with tab_sql:
         st.subheader("SQL avanzado")
@@ -1024,12 +1401,13 @@ else:
         if variable_selected in RADIOS_NUMERIC_VARIABLES and (categoria_value == "__ALL__"):
             default_sql = f"""
 SELECT
-    PROV,
-    DEPTO,
+    {sql_norm_code('PROV', 2)} AS provincia_codigo,
+    {sql_norm_code('DEPTO', 3)} AS departamento_codigo,
     {JOIN_COL_BY_YEAR[year_selected]} AS id_geo,
     {variable_selected} AS conteo
 FROM read_parquet('{source_url(year_selected, 'radios')}')
 WHERE {build_where_radios(provincia_code, departamento_code)}
+ORDER BY conteo DESC
 LIMIT 20
 """.strip()
         else:
@@ -1040,7 +1418,7 @@ WHERE codigo_variable = '{variable_selected}'
   AND {build_where_long(provincia_code=provincia_code, departamento_code=departamento_code, categoria_value=categoria_value)}
 LIMIT 20
 """.strip()
-        sql_custom = st.text_area("Consulta DuckDB", value=default_sql, height=180)
+        sql_custom = st.text_area("Consulta DuckDB", value=default_sql, height=220)
         if st.button("Ejecutar SQL"):
             try:
                 st.dataframe(run_sql(sql_custom), use_container_width=True)

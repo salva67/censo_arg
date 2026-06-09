@@ -1,16 +1,27 @@
 # Dashboard Censo Argentino · Streamlit + DuckDB
 
-Dashboard para consultar datos del **Censo Argentino** publicados en Source Cooperative, sin usar QGIS. La app lee archivos Parquet/GeoParquet remotos con DuckDB y permite explorar variables censales, filtrar por geografía, descargar resultados y visualizar radios censales en un mapa.
+Dashboard para consultar datos del **Censo Argentino** publicados en Source Cooperative, sin usar QGIS. La app lee archivos Parquet/GeoParquet remotos con DuckDB y permite explorar variables censales, filtrar por geografía, descargar resultados, generar gráficos informativos y visualizar radios censales en mapas con capas.
 
 ## Qué incluye
 
 - Consulta directa a Parquet remoto con DuckDB.
 - Selector de año censal: 1991, 2001, 2010 y 2022.
-- Buscador de variables censales desde `metadata.parquet`.
+- Buscador de variables censales desde `census-data.parquet`, enriquecido con `metadata.parquet`.
 - Filtros por provincia, departamento y categoría.
 - Agregación por provincia, departamento, categoría o radio censal.
-- Descarga de resultados a CSV.
-- Mapa de radios censales con GeoParquet + GeoPandas + PyDeck.
+- Descarga de resultados a CSV enriquecido.
+- KPIs automáticos: total, cantidad de áreas, promedio, mediana y área con mayor valor.
+- Gráficos informativos:
+  - ranking top N,
+  - participación sobre el total,
+  - Pareto acumulado,
+  - distribución de valores.
+- Mapa de radios censales con capas:
+  - polígonos coropléticos,
+  - burbujas por centroides,
+  - etiquetas para top radios,
+  - vista 3D,
+  - métrica de color por valor total, valor/km² o log(valor + 1).
 - Consola SQL avanzada dentro de Streamlit.
 - Script CLI opcional para consultas y exportaciones.
 
@@ -52,47 +63,13 @@ streamlit run app_censo_streamlit.py
 Ejemplo sugerido para validar rápido:
 
 - Año: `2022`
-- Buscar metadata: `poblacion`
+- Buscar variable: `pob`
 - Variable: `POB_TOT_P`
 - Provincia: `Buenos Aires`
+- Departamento: `Luján`
 - Agrupar por: `Departamento`
 
 Para el mapa conviene filtrar al menos una provincia y, si el resultado es pesado, un departamento.
-
-## Uso del script CLI
-
-Ver esquema de datos censales:
-
-```bash
-python consulta_censo_argentino.py schema --year 2022 --table census
-```
-
-Buscar variables:
-
-```bash
-python consulta_censo_argentino.py variables --year 2022 --search poblacion
-```
-
-Consultar población por departamento:
-
-```bash
-python consulta_censo_argentino.py query \
-  --year 2022 \
-  --variable POB_TOT_P \
-  --provincia "Buenos Aires" \
-  --group departamento \
-  --out outputs/poblacion_ba_departamento.csv
-```
-
-Exportar capa geográfica:
-
-```bash
-python consulta_censo_argentino.py geo \
-  --year 2022 \
-  --variable POB_TOT_P \
-  --provincia "Buenos Aires" \
-  --out outputs/radios_ba_poblacion.gpkg
-```
 
 ## Deploy en Streamlit Community Cloud
 
@@ -112,15 +89,10 @@ No requiere secrets ni credenciales porque consulta datos públicos remotos.
 - La app usa `httpfs` de DuckDB para leer Parquet por HTTPS.
 - Las geometrías se leen desde `radios.parquet`.
 - El join esperado es `radios.COD_YYYY = census.id_geo`, donde `YYYY` es el año censal.
-- Los archivos grandes pueden tardar al cargar mapas completos. Para mejor rendimiento, filtrar por provincia/departamento.
+- Para evitar el error de PyArrow al leer HTTPS desde GeoPandas en Streamlit Cloud, el GeoParquet se descarga primero a `/tmp/censo_argentino_cache` y después se lee localmente.
+- Los nombres de provincias y departamentos se intentan resolver con GeoRef. Si no responde, la app mantiene códigos como fallback.
+- Para `POB_TOT_P` y `VIV_TOT_P`, la app puede consultar directamente `radios.parquet`, porque esas variables están publicadas como columnas geográficas.
 
 ## Licencia
 
 Definir antes de publicar si el repositorio será público. Una opción habitual para proyectos demostrativos es MIT, pero conviene confirmarlo según el uso previsto.
-
-
-## Nota sobre variables POB_TOT_P / VIV_TOT_P
-
-La app consulta primero la tabla larga `census-data.parquet`. Para variables de totales muy usadas, como `POB_TOT_P` y `VIV_TOT_P`, la versión actual también puede consultar directamente `radios.parquet`, donde esas columnas están disponibles como atributos de los radios censales. Esto evita consultas vacías cuando esos totales no aparecen como filas en la tabla larga o cuando el filtro elegido no corresponde a una variable categórica.
-
-Si una consulta devuelve vacío, la app muestra un diagnóstico con el conteo exacto en `census-data.parquet` y variables parecidas disponibles.
