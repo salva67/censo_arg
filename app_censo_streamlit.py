@@ -856,6 +856,30 @@ def find_column_case_insensitive(columns: Iterable[str], wanted: str) -> str | N
     return None
 
 
+def unique_existing_columns(candidate_cols: Iterable[str], available_cols: Iterable[str]) -> list[str]:
+    """Devuelve columnas existentes, sin repetir.
+
+    GeoPandas falla al exportar GeoJSON si el GeoDataFrame seleccionado
+    contiene nombres duplicados. Esto puede pasar cuando metric_col == value_col
+    o después de algunos merges.
+    """
+    available = set(available_cols)
+    seen = set()
+    out = []
+    for col in candidate_cols:
+        if col in available and col not in seen:
+            out.append(col)
+            seen.add(col)
+    return out
+
+
+def drop_duplicated_columns_keep_first(df):
+    """Elimina columnas duplicadas preservando la primera ocurrencia."""
+    if len(df.columns) == len(set(df.columns)):
+        return df
+    return df.loc[:, ~pd.Index(df.columns).duplicated()].copy()
+
+
 @st.cache_resource(show_spinner=False)
 def download_remote_parquet(url: str) -> str:
     """Descarga un Parquet remoto a /tmp para que GeoPandas/PyArrow no dependan de HTTPS FS."""
@@ -940,6 +964,11 @@ def build_choropleth_map(
         return None, pd.DataFrame()
 
     gdf = gdf.copy()
+    gdf = drop_duplicated_columns_keep_first(gdf)
+
+    # Asegura que siga siendo GeoDataFrame después de eliminar duplicados.
+    if gpd is not None and "geometry" in gdf.columns and not isinstance(gdf, gpd.GeoDataFrame):
+        gdf = gpd.GeoDataFrame(gdf, geometry="geometry")
 
     if gdf.crs is None:
         gdf = gdf.set_crs(4326, allow_override=True)
@@ -986,9 +1015,15 @@ def build_choropleth_map(
     longitude = float(gdf["lon"].mean())
 
     join_col = JOIN_COL_BY_YEAR[year]
-    export_cols = [join_col, value_col, metric_col, "area_km2", "valor_por_km2", "fill_color", "elevation", "geometry"]
-    export_cols = [c for c in export_cols if c in gdf.columns]
-    geojson = json.loads(gdf[export_cols].to_json())
+    export_cols = unique_existing_columns(
+        [join_col, value_col, metric_col, "area_km2", "valor_por_km2", "fill_color", "elevation", "geometry"],
+        gdf.columns,
+    )
+    geojson_gdf = gdf[export_cols].copy()
+    geojson_gdf = drop_duplicated_columns_keep_first(geojson_gdf)
+    if gpd is not None and "geometry" in geojson_gdf.columns and not isinstance(geojson_gdf, gpd.GeoDataFrame):
+        geojson_gdf = gpd.GeoDataFrame(geojson_gdf, geometry="geometry", crs=gdf.crs)
+    geojson = json.loads(geojson_gdf.to_json())
 
     layers = []
     if show_polygons:
@@ -1007,9 +1042,11 @@ def build_choropleth_map(
             )
         )
 
-    point_cols = [join_col, value_col, metric_col, "area_km2", "valor_por_km2", "lon", "lat", "radio_burbuja", "label"]
-    point_cols = [c for c in point_cols if c in gdf.columns]
-    points_df = pd.DataFrame(gdf[point_cols].drop(columns=[], errors="ignore"))
+    point_cols = unique_existing_columns(
+        [join_col, value_col, metric_col, "area_km2", "valor_por_km2", "lon", "lat", "radio_burbuja", "label"],
+        gdf.columns,
+    )
+    points_df = pd.DataFrame(drop_duplicated_columns_keep_first(gdf[point_cols]))
 
     if show_bubbles:
         layers.append(
@@ -1061,7 +1098,8 @@ def build_choropleth_map(
     }
 
     deck = pdk.Deck(layers=layers, initial_view_state=view_state, tooltip=tooltip)
-    map_summary = gdf[[join_col, value_col, "area_km2", "valor_por_km2", "lon", "lat"]].copy()
+    summary_cols = unique_existing_columns([join_col, value_col, "area_km2", "valor_por_km2", "lon", "lat"], gdf.columns)
+    map_summary = pd.DataFrame(drop_duplicated_columns_keep_first(gdf[summary_cols])).copy()
     return deck, map_summary
 
 
@@ -1346,7 +1384,9 @@ else:
                             left_on=join_col,
                             right_on="id_geo",
                             how="inner",
+                            suffixes=("", "_dato"),
                         )
+                        gdf_plot = drop_duplicated_columns_keep_first(gdf_plot)
 
                     if gdf_plot.empty:
                         st.warning("El join entre radios y datos censales quedó vacío.")

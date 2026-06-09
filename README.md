@@ -96,3 +96,11 @@ No requiere secrets ni credenciales porque consulta datos públicos remotos.
 ## Licencia
 
 Definir antes de publicar si el repositorio será público. Una opción habitual para proyectos demostrativos es MIT, pero conviene confirmarlo según el uso previsto.
+
+
+## Cambios v6
+
+- Corrige el error `GeoDataFrame cannot contain duplicated column names` al generar el GeoJSON del mapa.
+- Deduplica columnas luego de merges y antes de construir capas PyDeck.
+- Evita columnas repetidas cuando la métrica elegida es el mismo campo que el valor (`conteo`).
+- Mantiene el mapa funcionando con coroplético, burbujas, etiquetas y vista 3D.
