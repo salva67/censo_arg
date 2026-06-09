@@ -118,6 +118,72 @@ GROUP_MAP_RADIOS = {
     "Radio censal": [],  # se completa dinámicamente con COD_YYYY
 }
 
+# Búsquedas temáticas para descubrir variables reales desde metadata/census-data.
+# No se hardcodean códigos porque pueden variar por año/procesamiento.
+VARIABLE_THEMES = {
+    "General": ["pob", "viv", "hogar"],
+    "Población y demografía": ["sexo", "edad", "parentesco", "nacimiento"],
+    "Vivienda": ["vivienda", "tipo", "material", "techo", "piso", "pared"],
+    "Hogar": ["hogar", "hacinamiento", "habit", "cuarto", "baño"],
+    "Servicios básicos": ["agua", "cloaca", "gas", "electric", "combustible", "desague"],
+    "Educación": ["educ", "asistencia", "nivel", "alfabet", "sabe leer"],
+    "Trabajo y actividad": ["trabajo", "actividad", "ocup", "empleo", "jubil"],
+    "Migración": ["nacimiento", "residencia", "migr", "pais"],
+    "Discapacidad / dificultad": ["dificultad", "limitacion", "discap", "caminar", "recordar"],
+    "Tecnología": ["internet", "computadora", "celular", "telefono"],
+}
+
+MEASURE_MODES = [
+    "Conteo absoluto",
+    "% dentro de la variable",
+    "% sobre población total",
+    "% sobre viviendas totales",
+]
+
+
+BASE_MAP_STYLES = {
+    "Calles y etiquetas (CARTO Voyager)": {
+        "provider": "carto",
+        "style": "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json",
+        "desc": "Más contexto urbano: calles, rutas, barrios y etiquetas."
+    },
+    "Claro detallado (CARTO Positron)": {
+        "provider": "carto",
+        "style": "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
+        "desc": "Fondo claro, prolijo y útil para coropléticos."
+    },
+    "Oscuro detallado (CARTO Dark Matter)": {
+        "provider": "carto",
+        "style": "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
+        "desc": "Fondo oscuro con buen contraste para capas luminosas."
+    },
+    "Calles simple": {
+        "provider": "carto",
+        "style": "road",
+        "desc": "Estilo de calles provisto por el proveedor del mapa."
+    },
+    "Claro sin etiquetas": {
+        "provider": "carto",
+        "style": "light_no_labels",
+        "desc": "Base limpia para mirar sólo la capa censal."
+    },
+    "Oscuro sin etiquetas": {
+        "provider": "carto",
+        "style": "dark_no_labels",
+        "desc": "Base oscura limpia, sin etiquetas que compitan con el dato."
+    },
+    "Tema Streamlit": {
+        "provider": "carto",
+        "style": None,
+        "desc": "Deja que Streamlit adapte el estilo al tema activo."
+    },
+    "Sin mapa base": {
+        "provider": None,
+        "style": None,
+        "desc": "Sólo capas censales. Útil si la base carga lento."
+    },
+}
+
 
 # -----------------------------------------------------------------------------
 # Utilidades SQL / DuckDB
@@ -726,6 +792,110 @@ def query_censo_radios(
     return pd.DataFrame()
 
 
+def _common_key_columns(left: pd.DataFrame, right: pd.DataFrame) -> list[str]:
+    excluded = {"conteo", "conteo_abs", "denominador", "pct_variable", "valor_medido"}
+    return [c for c in left.columns if c in right.columns and c not in excluded]
+
+
+def _apply_measure_from_denominator(
+    df_base: pd.DataFrame,
+    denom_df: pd.DataFrame | None,
+    denom_scalar: float | None,
+    measure_mode: str,
+) -> pd.DataFrame:
+    """Convierte conteos absolutos a la medición elegida manteniendo trazabilidad."""
+    out = df_base.copy()
+    if out.empty or "conteo" not in out.columns:
+        return out
+
+    out["conteo_abs"] = pd.to_numeric(out["conteo"], errors="coerce").fillna(0)
+
+    if measure_mode == "Conteo absoluto":
+        out["valor_medido"] = out["conteo_abs"]
+        out["tipo_medicion"] = measure_mode
+        return out
+
+    if denom_df is not None and not denom_df.empty:
+        denom = denom_df.copy()
+        denom["denominador"] = pd.to_numeric(denom["conteo"], errors="coerce").fillna(0)
+        keys = _common_key_columns(out, denom)
+        if keys:
+            out = out.merge(denom[keys + ["denominador"]], on=keys, how="left")
+        else:
+            out["denominador"] = float(denom["denominador"].sum())
+    else:
+        out["denominador"] = float(denom_scalar or 0)
+
+    out["denominador"] = pd.to_numeric(out["denominador"], errors="coerce").fillna(0)
+    out["pct_variable"] = np.where(out["denominador"] > 0, out["conteo_abs"] / out["denominador"], 0)
+    out["valor_medido"] = out["pct_variable"] * 100
+    out["conteo"] = out["valor_medido"]
+    out["tipo_medicion"] = measure_mode
+    return out
+
+
+@st.cache_data(show_spinner=True, ttl=60 * 30)
+def query_denominator_radios_scalar(
+    year: int,
+    denom_variable: str,
+    provincia_code: str | None,
+    departamento_code: str | None,
+) -> float:
+    url = source_url(year, "radios")
+    where = build_where_radios(provincia_code, departamento_code)
+    sql = f"""
+    SELECT SUM({denom_variable}) AS denominador
+    FROM read_parquet({sql_quote(url)})
+    WHERE {where}
+    """
+    df = run_sql(sql)
+    if df.empty:
+        return 0.0
+    value = pd.to_numeric(df.iloc[0].get("denominador", 0), errors="coerce")
+    return 0.0 if pd.isna(value) else float(value)
+
+
+def query_with_measure_mode(
+    year: int,
+    variable: str,
+    provincia_code: str | None,
+    departamento_code: str | None,
+    categoria_value: str | None,
+    group_label: str,
+    limit: int,
+    measure_mode: str,
+    source_kind: str,
+) -> pd.DataFrame:
+    """Ejecuta la consulta base y agrega métricas porcentuales si corresponde."""
+    if source_kind == "radios":
+        df_base = query_censo_radios(year, variable, provincia_code, departamento_code, group_label, limit)
+    else:
+        df_base = query_censo_long(year, variable, provincia_code, departamento_code, categoria_value, group_label, limit)
+
+    if df_base.empty or measure_mode == "Conteo absoluto":
+        return _apply_measure_from_denominator(df_base, None, None, measure_mode)
+
+    if measure_mode == "% dentro de la variable":
+        if source_kind == "radios":
+            # Para variables directas de radios, el porcentaje dentro de sí misma no agrega información.
+            return _apply_measure_from_denominator(df_base, df_base, None, measure_mode)
+        if group_label == "Categoría":
+            denom_total = float(query_censo_long(year, variable, provincia_code, departamento_code, "__ALL__", "Categoría", 0)["conteo"].sum())
+            return _apply_measure_from_denominator(df_base, None, denom_total, measure_mode)
+        denom_df = query_censo_long(year, variable, provincia_code, departamento_code, "__ALL__", group_label, 0)
+        return _apply_measure_from_denominator(df_base, denom_df, None, measure_mode)
+
+    if measure_mode in {"% sobre población total", "% sobre viviendas totales"}:
+        denom_var = "POB_TOT_P" if measure_mode == "% sobre población total" else "VIV_TOT_P"
+        if group_label == "Categoría":
+            denom_total = query_denominator_radios_scalar(year, denom_var, provincia_code, departamento_code)
+            return _apply_measure_from_denominator(df_base, None, denom_total, measure_mode)
+        denom_df = query_censo_radios(year, denom_var, provincia_code, departamento_code, group_label, 0)
+        return _apply_measure_from_denominator(df_base, denom_df, None, measure_mode)
+
+    return _apply_measure_from_denominator(df_base, None, None, "Conteo absoluto")
+
+
 @st.cache_data(show_spinner=True, ttl=60 * 30)
 def query_censo_resilient(
     year: int,
@@ -735,31 +905,32 @@ def query_censo_resilient(
     categoria_value: str | None,
     group_label: str,
     limit: int,
+    measure_mode: str = "Conteo absoluto",
 ) -> tuple[pd.DataFrame, str]:
-    """Consulta principal. Si la tabla larga no tiene el total solicitado, cae a radios.parquet."""
+    """Consulta principal con soporte para conteos y porcentajes."""
     # Para variables de radios, conviene ir directo al archivo geográfico si no hay categoría.
     if variable in RADIOS_NUMERIC_VARIABLES and (not categoria_value or categoria_value == "__ALL__"):
-        df_radios = query_censo_radios(
-            year, variable, provincia_code, departamento_code, group_label, limit
+        df_radios = query_with_measure_mode(
+            year, variable, provincia_code, departamento_code, categoria_value, group_label, limit, measure_mode, "radios"
         )
         if not df_radios.empty:
-            return df_radios, "radios.parquet"
+            return df_radios, f"radios.parquet · {measure_mode}"
 
-    df_long = query_censo_long(
-        year, variable, provincia_code, departamento_code, categoria_value, group_label, limit
+    df_long = query_with_measure_mode(
+        year, variable, provincia_code, departamento_code, categoria_value, group_label, limit, measure_mode, "census"
     )
     if not df_long.empty:
-        return df_long, "census-data.parquet"
+        return df_long, f"census-data.parquet · {measure_mode}"
 
     # Fallback final para POB_TOT_P / VIV_TOT_P si la primera consulta fue vacía.
     if variable in RADIOS_NUMERIC_VARIABLES and (not categoria_value or categoria_value == "__ALL__"):
-        df_radios = query_censo_radios(
-            year, variable, provincia_code, departamento_code, group_label, limit
+        df_radios = query_with_measure_mode(
+            year, variable, provincia_code, departamento_code, categoria_value, group_label, limit, measure_mode, "radios"
         )
         if not df_radios.empty:
-            return df_radios, "radios.parquet"
+            return df_radios, f"radios.parquet · {measure_mode}"
 
-    return df_long, "census-data.parquet"
+    return df_long, f"census-data.parquet · {measure_mode}"
 
 
 @st.cache_data(show_spinner=True, ttl=60 * 30)
@@ -769,8 +940,10 @@ def query_radio_counts(
     provincia_code: str | None,
     departamento_code: str | None,
     categoria_value: str | None,
+    measure_mode: str = "Conteo absoluto",
 ) -> tuple[pd.DataFrame, str]:
-    """Conteo a nivel radio para mapa."""
+    """Conteo o indicador a nivel radio para mapa."""
+    source_kind = "census"
     if variable in RADIOS_NUMERIC_VARIABLES and (not categoria_value or categoria_value == "__ALL__"):
         url = source_url(year, "radios")
         join_col = JOIN_COL_BY_YEAR[year]
@@ -783,24 +956,43 @@ def query_radio_counts(
         WHERE {where}
         GROUP BY 1
         """
-        return run_sql(sql), "radios.parquet"
+        df_base = run_sql(sql)
+        source_kind = "radios"
+        source_name = "radios.parquet"
+    else:
+        url = source_url(year, "census")
+        where = build_where_long(
+            variable=variable,
+            provincia_code=provincia_code,
+            departamento_code=departamento_code,
+            categoria_value=categoria_value,
+        )
+        sql = f"""
+        SELECT
+            id_geo,
+            SUM(conteo) AS conteo
+        FROM read_parquet({sql_quote(url)})
+        WHERE {where}
+        GROUP BY 1
+        """
+        df_base = run_sql(sql)
+        source_name = "census-data.parquet"
 
-    url = source_url(year, "census")
-    where = build_where_long(
-        variable=variable,
-        provincia_code=provincia_code,
-        departamento_code=departamento_code,
-        categoria_value=categoria_value,
-    )
-    sql = f"""
-    SELECT
-        id_geo,
-        SUM(conteo) AS conteo
-    FROM read_parquet({sql_quote(url)})
-    WHERE {where}
-    GROUP BY 1
-    """
-    return run_sql(sql), "census-data.parquet"
+    if df_base.empty or measure_mode == "Conteo absoluto":
+        return _apply_measure_from_denominator(df_base, None, None, measure_mode), f"{source_name} · {measure_mode}"
+
+    if measure_mode == "% dentro de la variable":
+        if source_kind == "radios":
+            return _apply_measure_from_denominator(df_base, df_base, None, measure_mode), f"{source_name} · {measure_mode}"
+        denom_df = query_censo_long(year, variable, provincia_code, departamento_code, "__ALL__", "Radio censal", 0)
+        return _apply_measure_from_denominator(df_base, denom_df, None, measure_mode), f"{source_name} · {measure_mode}"
+
+    if measure_mode in {"% sobre población total", "% sobre viviendas totales"}:
+        denom_var = "POB_TOT_P" if measure_mode == "% sobre población total" else "VIV_TOT_P"
+        denom_df = query_censo_radios(year, denom_var, provincia_code, departamento_code, "Radio censal", 0)
+        return _apply_measure_from_denominator(df_base, denom_df, None, measure_mode), f"{source_name} · {measure_mode}"
+
+    return _apply_measure_from_denominator(df_base, None, None, "Conteo absoluto"), source_name
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 30)
@@ -993,6 +1185,23 @@ def compute_norm_series(values: pd.Series, method: str = "Continuo", clip_upper_
     return ((s.clip(lower=lower, upper=upper) - lower) / denom).fillna(0).clip(0, 1)
 
 
+def get_base_map_config(base_map_style: str):
+    """Devuelve proveedor y estilo de mapa base para PyDeck.
+
+Los estilos de CARTO no requieren token en este uso. La opción "Sin mapa base"
+renderiza sólo las capas censales.
+    """
+    cfg = BASE_MAP_STYLES.get(base_map_style, BASE_MAP_STYLES["Calles y etiquetas (CARTO Voyager)"])
+    return cfg.get("provider"), cfg.get("style"), cfg.get("desc", "")
+
+
+def format_small_float(value: float | int | None, decimals: int = 2) -> str:
+    if value is None or pd.isna(value):
+        return "-"
+    text = f"{float(value):,.{decimals}f}"
+    return text.replace(",", "X").replace(".", ",").replace("X", ".")
+
+
 def compute_view_state(gdf, extruded: bool = False):
     """Centra el mapa usando bounds y calcula un zoom aproximado según extensión."""
     bounds = gdf.total_bounds  # minx, miny, maxx, maxy
@@ -1041,10 +1250,15 @@ def build_choropleth_map(
     show_bubbles: bool = False,
     show_heatmap: bool = False,
     show_labels: bool = False,
+    show_outline_layer: bool = True,
+    show_centroid_reference: bool = False,
     label_top_n: int = 20,
+    label_mode: str = "Valor",
     bubble_scale: float = 1.0,
     heatmap_radius: int = 45,
     extruded: bool = False,
+    base_map_style: str = "Calles y etiquetas (CARTO Voyager)",
+    map_height: int = 680,
 ):
     if pdk is None:
         raise RuntimeError("Falta pydeck. Instalá: pip install pydeck")
@@ -1090,15 +1304,26 @@ def build_choropleth_map(
     gdf["elevation"] = (gdf["_norm"] * 3500).fillna(0)
     gdf["ranking_mapa"] = gdf[value_col].rank(method="first", ascending=False).astype(int)
     gdf["percentil_mapa"] = gdf[value_col].rank(method="average", pct=True).fillna(0)
+    gdf["percentil_mapa_pct"] = (gdf["percentil_mapa"] * 100).round(1).astype(str) + "%"
+    gdf["valor_fmt"] = gdf[value_col].map(format_number)
+    gdf["area_km2_fmt"] = gdf["area_km2"].map(lambda x: format_small_float(x, 2))
+    gdf["valor_por_km2_fmt"] = gdf["valor_por_km2"].map(lambda x: format_small_float(x, 1))
 
     # Centroides en CRS proyectado para evitar distorsión y warnings.
     centroids = gdf.to_crs(3857).geometry.centroid.to_crs(4326)
     gdf["lon"] = centroids.x
     gdf["lat"] = centroids.y
     gdf["radio_burbuja"] = (70 + 1250 * np.sqrt(gdf["_norm"].clip(0, 1)) * float(bubble_scale)).fillna(70)
-    gdf["label"] = gdf[value_col].round(0).astype("Int64").astype(str)
-
     join_col = JOIN_COL_BY_YEAR[year]
+    if label_mode == "Código de radio":
+        gdf["label"] = gdf[join_col].astype(str)
+    elif label_mode == "Ranking":
+        gdf["label"] = "#" + gdf["ranking_mapa"].astype(str)
+    elif label_mode == "Percentil":
+        gdf["label"] = gdf["percentil_mapa_pct"]
+    else:
+        gdf["label"] = gdf[value_col].round(0).astype("Int64").astype(str)
+
     export_cols = unique_existing_columns(
         [
             join_col,
@@ -1106,8 +1331,12 @@ def build_choropleth_map(
             metric_col,
             "ranking_mapa",
             "percentil_mapa",
+            "percentil_mapa_pct",
+            "valor_fmt",
             "area_km2",
+            "area_km2_fmt",
             "valor_por_km2",
+            "valor_por_km2_fmt",
             "color_hex",
             "fill_color",
             "elevation",
@@ -1138,6 +1367,19 @@ def build_choropleth_map(
             )
         )
 
+    if show_outline_layer:
+        layers.append(
+            pdk.Layer(
+                "GeoJsonLayer",
+                geojson,
+                pickable=False,
+                stroked=True,
+                filled=False,
+                get_line_color=[10, 10, 10, max(120, int(border_opacity))],
+                line_width_min_pixels=max(0.7, float(border_width)),
+            )
+        )
+
     point_cols = unique_existing_columns(
         [
             join_col,
@@ -1145,8 +1387,12 @@ def build_choropleth_map(
             metric_col,
             "ranking_mapa",
             "percentil_mapa",
+            "percentil_mapa_pct",
+            "valor_fmt",
             "area_km2",
+            "area_km2_fmt",
             "valor_por_km2",
+            "valor_por_km2_fmt",
             "lon",
             "lat",
             "radio_burbuja",
@@ -1167,6 +1413,20 @@ def build_choropleth_map(
                 radius_pixels=int(heatmap_radius),
                 intensity=1,
                 threshold=0.03,
+            )
+        )
+
+    if show_centroid_reference:
+        layers.append(
+            pdk.Layer(
+                "ScatterplotLayer",
+                points_df,
+                pickable=False,
+                get_position="[lon, lat]",
+                get_radius=35,
+                get_fill_color=[20, 20, 20, 90],
+                get_line_color=[255, 255, 255, 120],
+                line_width_min_pixels=0.5,
             )
         )
 
@@ -1205,21 +1465,31 @@ def build_choropleth_map(
 
     tooltip = {
         "html": (
+            "<div style='min-width:210px'>"
             "<b>Radio:</b> {" + join_col + "}<br/>"
-            "<b>Valor:</b> {" + value_col + "}<br/>"
+            "<b>Valor:</b> {valor_fmt}<br/>"
             "<b>Ranking:</b> {ranking_mapa}<br/>"
-            "<b>Percentil:</b> {percentil_mapa}<br/>"
-            "<b>Km²:</b> {area_km2}<br/>"
-            "<b>Valor/km²:</b> {valor_por_km2}<br/>"
+            "<b>Percentil:</b> {percentil_mapa_pct}<br/>"
+            "<b>Km²:</b> {area_km2_fmt}<br/>"
+            "<b>Valor/km²:</b> {valor_por_km2_fmt}<br/>"
             f"<b>Capa:</b> {metric_title}<br/>"
             f"<b>Escala:</b> {color_method}"
+            "</div>"
         ),
-        "style": {"backgroundColor": "white", "color": "black"},
+        "style": {"backgroundColor": "rgba(255,255,255,0.96)", "color": "black"},
     }
 
-    deck = pdk.Deck(layers=layers, initial_view_state=view_state, tooltip=tooltip)
+    map_provider, map_style, _ = get_base_map_config(base_map_style)
+    deck = pdk.Deck(
+        layers=layers,
+        initial_view_state=view_state,
+        tooltip=tooltip,
+        map_provider=map_provider,
+        map_style=map_style,
+        height=int(map_height),
+    )
     summary_cols = unique_existing_columns(
-        [join_col, value_col, metric_col, "ranking_mapa", "percentil_mapa", "area_km2", "valor_por_km2", "lon", "lat", "color_hex"],
+        [join_col, value_col, metric_col, "ranking_mapa", "percentil_mapa", "percentil_mapa_pct", "valor_fmt", "area_km2", "area_km2_fmt", "valor_por_km2", "valor_por_km2_fmt", "lon", "lat", "color_hex"],
         gdf.columns,
     )
     map_summary = pd.DataFrame(drop_duplicated_columns_keep_first(gdf[summary_cols])).copy()
@@ -1254,13 +1524,23 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Variable")
+    theme_selected = st.selectbox(
+        "Tema de variables",
+        list(VARIABLE_THEMES.keys()),
+        index=0,
+        help="Preselecciona términos de búsqueda para descubrir variables reales del censo.",
+    )
+    default_search = " OR ".join(VARIABLE_THEMES.get(theme_selected, ["pob"])[:3])
     variable_search = st.text_input(
         "Buscar variable",
-        value="pob",
-        help="Busca sobre las variables presentes en census-data.parquet. También incluye POB_TOT_P/VIV_TOT_P desde radios.parquet.",
+        value=default_search,
+        help="Busca sobre las variables presentes en census-data.parquet. Podés escribir edad, sexo, vivienda, agua, educación, internet, etc.",
     )
 
-    variables_df = get_census_variables(year_selected, variable_search, limit=500)
+    # El buscador admite términos separados por OR para ampliar el descubrimiento temático.
+    search_terms = [t.strip() for t in variable_search.split(" OR ") if t.strip()] or [variable_search]
+    variables_parts = [get_census_variables(year_selected, term, limit=250) for term in search_terms]
+    variables_df = pd.concat(variables_parts, ignore_index=True).drop_duplicates(subset=["codigo_variable", "fuente"]) if variables_parts else pd.DataFrame()
     if variables_df.empty:
         st.warning("No encontré variables con esa búsqueda. Probá con otro término o escribí el código exacto abajo.")
 
@@ -1329,6 +1609,15 @@ with st.sidebar:
     departamento_code = dept_options[selected_dept_label]
 
     st.divider()
+    st.subheader("Medición")
+    measure_mode = st.selectbox(
+        "Cómo medir",
+        MEASURE_MODES,
+        index=0,
+        help="Usá porcentajes para comparar zonas de distinto tamaño. El conteo absoluto sirve para volumen/concentración.",
+    )
+
+    st.divider()
     st.subheader("Categoría")
     categorias = ensure_dataframe(get_categorias(year_selected, variable_selected), "categorías")
     cat_options = {"Todas": "__ALL__"}
@@ -1349,7 +1638,7 @@ col_a, col_b, col_c, col_d = st.columns(4)
 col_a.metric("Año", str(year_selected))
 col_b.metric("Variable", variable_selected)
 col_c.metric("Provincia", "Todas" if provincia_code == "__ALL__" else selected_prov_label.split(" (")[0])
-col_d.metric("Agrupación", group_selected)
+col_d.metric("Medición", measure_mode)
 
 try:
     df_result, query_source = query_censo_resilient(
@@ -1360,6 +1649,7 @@ try:
         categoria_value=categoria_value,
         group_label=group_selected,
         limit=limit_rows,
+        measure_mode=measure_mode,
     )
 except Exception as exc:
     st.error("No pude ejecutar la consulta principal.")
@@ -1394,7 +1684,8 @@ else:
     summary = summarize_result(df_enriched, label_col)
 
     col_total, col_source = st.columns([1, 2])
-    col_total.metric("Total según consulta", format_number(summary["total"]))
+    metric_title_main = "Total según consulta" if measure_mode == "Conteo absoluto" else "Suma de valores medidos"
+    col_total.metric(metric_title_main, format_number(summary["total"]))
     col_source.info(f"Fuente usada para esta consulta: {query_source}")
 
     tab_resumen, tab_graficos, tab_mapa, tab_metadata, tab_sql = st.tabs(
@@ -1404,16 +1695,23 @@ else:
     with tab_resumen:
         st.subheader("Resumen ejecutivo")
         kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-        kpi1.metric("Total", format_number(summary["total"]))
+        kpi1.metric("Total" if measure_mode == "Conteo absoluto" else "Suma medición", format_number(summary["total"]))
         kpi2.metric("Áreas", format_number(summary["n_areas"]))
         kpi3.metric("Promedio por área", format_number(summary["mean_value"]))
         kpi4.metric("Mediana por área", format_number(summary["median_value"]))
 
-        st.caption(
-            f"Área con mayor valor: **{summary['top_label']}** "
-            f"con {format_number(summary['top_value'])} "
-            f"({summary['top_share']:.1%} del total)."
-        )
+        if measure_mode == "Conteo absoluto":
+            st.caption(
+                f"Área con mayor valor: **{summary['top_label']}** "
+                f"con {format_number(summary['top_value'])} "
+                f"({summary['top_share']:.1%} del total)."
+            )
+        else:
+            st.caption(
+                f"Área con mayor medición: **{summary['top_label']}** "
+                f"con {format_small_float(summary['top_value'], 2)}%. "
+                "Las columnas `conteo_abs`, `denominador` y `pct_variable` conservan la trazabilidad."
+            )
 
         display_df = df_enriched.copy()
         if "pct_total" in display_df.columns:
@@ -1479,6 +1777,25 @@ else:
                     "y **Log(valor + 1)** cuando un radio muy grande domina la escala. La escala por **cuantiles** reparte los colores "
                     "de forma más equilibrada cuando hay muchos outliers."
                 )
+
+            st.markdown("**Mapa base y contexto**")
+            base1, base2, base3, base4 = st.columns(4)
+            with base1:
+                base_map_style = st.selectbox(
+                    "Mapa base",
+                    list(BASE_MAP_STYLES.keys()),
+                    index=0,
+                    help="Voyager suele ser el más informativo porque muestra calles, rutas y etiquetas."
+                )
+                st.caption(BASE_MAP_STYLES[base_map_style]["desc"])
+            with base2:
+                map_height = st.slider("Alto del mapa", 420, 900, 680, 20)
+                show_outline_layer = st.checkbox("Contorno reforzado", value=True)
+            with base3:
+                show_centroid_reference = st.checkbox("Centroides de referencia", value=False)
+                label_mode = st.selectbox("Texto de etiquetas", ["Valor", "Ranking", "Percentil", "Código de radio"], index=0)
+            with base4:
+                st.info("Para ver mejor calles y etiquetas, bajá la opacidad de polígonos a 90–130 o usá base Voyager.")
 
             cfg1, cfg2, cfg3, cfg4 = st.columns(4)
             with cfg1:
@@ -1575,6 +1892,7 @@ else:
                             provincia_code,
                             departamento_code,
                             categoria_value,
+                            measure_mode,
                         )
                         if radio_counts.empty:
                             st.warning("No hay datos a nivel radio para mapear con esos filtros.")
@@ -1632,10 +1950,15 @@ else:
                             show_bubbles=show_bubbles,
                             show_heatmap=show_heatmap,
                             show_labels=show_labels,
+                            show_outline_layer=show_outline_layer,
+                            show_centroid_reference=show_centroid_reference,
                             label_top_n=label_top_n,
+                            label_mode=label_mode,
                             bubble_scale=bubble_scale,
                             heatmap_radius=heatmap_radius,
                             extruded=extruded,
+                            base_map_style=base_map_style,
+                            map_height=map_height,
                         )
                         st.pydeck_chart(deck, use_container_width=True)
 
@@ -1673,6 +1996,12 @@ else:
         st.subheader("Variables disponibles")
         st.caption("Esta tabla está basada en los códigos presentes en census-data.parquet y enriquecida con metadata.parquet.")
         st.dataframe(variables_df, use_container_width=True, hide_index=True)
+
+        st.subheader("Explorador rápido por tema")
+        theme_rows = []
+        for tema, terms in VARIABLE_THEMES.items():
+            theme_rows.append({"tema": tema, "buscar_por": ", ".join(terms)})
+        st.dataframe(pd.DataFrame(theme_rows), use_container_width=True, hide_index=True)
 
         with st.expander("Ver metadata completa"):
             st.dataframe(get_metadata(year_selected), use_container_width=True)

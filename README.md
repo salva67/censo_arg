@@ -121,3 +121,31 @@ Definir antes de publicar si el repositorio será público. Una opción habitual
 - Mejora tooltips con ranking, percentil, área y valor por km².
 - Calcula centroides en CRS proyectado antes de mostrarlos como burbujas/etiquetas.
 - Agrega tabla descargable de radios efectivamente mapeados.
+
+## Cambios v8
+
+- Agrega selector de **mapa base**:
+  - CARTO Voyager, recomendado para contexto urbano con calles y etiquetas.
+  - CARTO Positron, fondo claro para coropléticos.
+  - CARTO Dark Matter, fondo oscuro de alto contraste.
+  - Calles simple, claro/oscuro sin etiquetas, tema Streamlit y sin base.
+- Agrega control de **alto del mapa**.
+- Agrega **contorno reforzado** para mejorar lectura de límites censales.
+- Agrega **centroides de referencia** independientes de la capa de burbujas.
+- Permite elegir el texto de etiquetas: valor, ranking, percentil o código de radio.
+- Mejora tooltips con valores formateados para lectura ejecutiva.
+- Recomendación: para que la base sea visible, usar CARTO Voyager y bajar la opacidad de polígonos a 90–130.
+
+
+## v9 - Variables e indicadores
+
+La app incorpora un selector temático para descubrir variables reales del archivo `census-data.parquet` usando `metadata.parquet`. Además de `POB_TOT_P` y `VIV_TOT_P`, se pueden buscar dimensiones como vivienda, hogar, servicios básicos, educación, trabajo, migración, discapacidad y tecnología.
+
+También agrega modos de medición:
+
+- Conteo absoluto
+- % dentro de la variable
+- % sobre población total
+- % sobre viviendas totales
+
+Para variables categóricas, primero elegí el tema y la variable; después seleccioná una categoría concreta. Ejemplo: buscar `agua`, elegir la variable correspondiente y medir una categoría como porcentaje sobre viviendas totales.
