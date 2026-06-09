@@ -15,13 +15,17 @@ Ejecutar:
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+from pathlib import Path
 from typing import Iterable
 
 import altair as alt
 import duckdb
 import pandas as pd
 import streamlit as st
+import requests
 
 try:
     import geopandas as gpd
@@ -43,6 +47,7 @@ st.set_page_config(
 
 VALID_YEARS = [1991, 2001, 2010, 2022]
 BASE_URL = "https://data.source.coop/nlebovits/censo-argentino/{year}/{filename}"
+CACHE_DIR = Path(os.getenv("CENSO_CACHE_DIR", "/tmp/censo_argentino_cache"))
 FILES = {
     "census": "census-data.parquet",
     "metadata": "metadata.parquet",
@@ -281,6 +286,28 @@ def get_departamentos(year: int, provincia_code: str | None) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60)
+def get_geo_names(year: int) -> pd.DataFrame:
+    """Dimensión geográfica con etiquetas de provincia/departamento desde census-data.parquet."""
+    url = source_url(year, "census")
+    sql = f"""
+    SELECT
+        LPAD(CAST(valor_provincia AS VARCHAR), 2, '0') AS prov_norm,
+        any_value(valor_provincia) AS valor_provincia,
+        any_value(etiqueta_provincia) AS etiqueta_provincia,
+        LPAD(CAST(valor_departamento AS VARCHAR), 3, '0') AS depto_norm,
+        any_value(valor_departamento) AS valor_departamento,
+        any_value(etiqueta_departamento) AS etiqueta_departamento
+    FROM read_parquet({sql_quote(url)})
+    WHERE valor_provincia IS NOT NULL
+      AND etiqueta_provincia IS NOT NULL
+      AND valor_departamento IS NOT NULL
+      AND etiqueta_departamento IS NOT NULL
+    GROUP BY 1, 4
+    """
+    return run_sql(sql)
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60)
 def get_categorias(year: int, variable: str | None) -> pd.DataFrame:
     if not variable:
         return pd.DataFrame(columns=["valor_categoria", "etiqueta_categoria"])
@@ -352,39 +379,103 @@ def query_censo_radios(
     group_label: str,
     limit: int,
 ) -> pd.DataFrame:
+    """Consulta variables que viven como columnas en radios.parquet, enriqueciendo nombres desde census-data."""
     if variable not in RADIOS_NUMERIC_VARIABLES:
         return pd.DataFrame()
     if group_label == "Categoría":
         return pd.DataFrame()
 
-    url = source_url(year, "radios")
+    radios_url = source_url(year, "radios")
+    census_url = source_url(year, "census")
     join_col = JOIN_COL_BY_YEAR[year]
     where = build_where_radios(provincia_code, departamento_code)
 
-    if group_label == "Provincia":
-        select_cols = "PROV AS valor_provincia, PROV AS etiqueta_provincia"
-        group_by = "1, 2"
-    elif group_label == "Departamento":
-        select_cols = "PROV AS valor_provincia, PROV AS etiqueta_provincia, DEPTO AS valor_departamento, DEPTO AS etiqueta_departamento"
-        group_by = "1, 2, 3, 4"
-    elif group_label == "Radio censal":
-        select_cols = f"{join_col} AS id_geo"
-        group_by = "1"
-    else:
-        return pd.DataFrame()
+    # geo_names evita mostrar solo códigos de departamento cuando consultamos radios.parquet.
+    geo_names_cte = f"""
+    geo_names AS (
+        SELECT
+            LPAD(CAST(valor_provincia AS VARCHAR), 2, '0') AS prov_norm,
+            any_value(valor_provincia) AS valor_provincia,
+            any_value(etiqueta_provincia) AS etiqueta_provincia,
+            LPAD(CAST(valor_departamento AS VARCHAR), 3, '0') AS depto_norm,
+            any_value(valor_departamento) AS valor_departamento,
+            any_value(etiqueta_departamento) AS etiqueta_departamento
+        FROM read_parquet({sql_quote(census_url)})
+        WHERE valor_provincia IS NOT NULL
+          AND etiqueta_provincia IS NOT NULL
+          AND valor_departamento IS NOT NULL
+          AND etiqueta_departamento IS NOT NULL
+        GROUP BY 1, 4
+    )
+    """
 
     limit_clause = f"LIMIT {int(limit)}" if limit else ""
-    sql = f"""
-    SELECT
-        {select_cols},
-        SUM({variable}) AS conteo
-    FROM read_parquet({sql_quote(url)})
-    WHERE {where}
-    GROUP BY {group_by}
-    ORDER BY conteo DESC
-    {limit_clause}
-    """
-    return run_sql(sql)
+
+    if group_label == "Provincia":
+        sql = f"""
+        WITH r AS (
+            SELECT
+                LPAD(CAST(PROV AS VARCHAR), 2, '0') AS prov_norm,
+                SUM({variable}) AS conteo
+            FROM read_parquet({sql_quote(radios_url)})
+            WHERE {where}
+            GROUP BY 1
+        ), {geo_names_cte}
+        SELECT
+            COALESCE(g.valor_provincia, r.prov_norm) AS valor_provincia,
+            COALESCE(g.etiqueta_provincia, r.prov_norm) AS etiqueta_provincia,
+            r.conteo
+        FROM r
+        LEFT JOIN (
+            SELECT prov_norm, any_value(valor_provincia) AS valor_provincia, any_value(etiqueta_provincia) AS etiqueta_provincia
+            FROM geo_names
+            GROUP BY 1
+        ) g USING (prov_norm)
+        ORDER BY conteo DESC
+        {limit_clause}
+        """
+        return run_sql(sql)
+
+    if group_label == "Departamento":
+        sql = f"""
+        WITH r AS (
+            SELECT
+                LPAD(CAST(PROV AS VARCHAR), 2, '0') AS prov_norm,
+                LPAD(CAST(DEPTO AS VARCHAR), 3, '0') AS depto_norm,
+                SUM({variable}) AS conteo
+            FROM read_parquet({sql_quote(radios_url)})
+            WHERE {where}
+            GROUP BY 1, 2
+        ), {geo_names_cte}
+        SELECT
+            COALESCE(g.valor_provincia, r.prov_norm) AS valor_provincia,
+            COALESCE(g.etiqueta_provincia, r.prov_norm) AS etiqueta_provincia,
+            COALESCE(g.valor_departamento, r.depto_norm) AS valor_departamento,
+            COALESCE(g.etiqueta_departamento, r.depto_norm) AS etiqueta_departamento,
+            r.conteo
+        FROM r
+        LEFT JOIN geo_names g
+          ON r.prov_norm = g.prov_norm
+         AND r.depto_norm = g.depto_norm
+        ORDER BY conteo DESC
+        {limit_clause}
+        """
+        return run_sql(sql)
+
+    if group_label == "Radio censal":
+        sql = f"""
+        SELECT
+            {join_col} AS id_geo,
+            SUM({variable}) AS conteo
+        FROM read_parquet({sql_quote(radios_url)})
+        WHERE {where}
+        GROUP BY 1
+        ORDER BY conteo DESC
+        {limit_clause}
+        """
+        return run_sql(sql)
+
+    return pd.DataFrame()
 
 
 @st.cache_data(show_spinner=True, ttl=60 * 30)
@@ -517,6 +608,27 @@ def find_column_case_insensitive(columns: Iterable[str], wanted: str) -> str | N
     return None
 
 
+@st.cache_resource(show_spinner=False)
+def download_remote_parquet(url: str) -> str:
+    """Descarga un Parquet remoto a /tmp para que GeoPandas/PyArrow no dependan de HTTPS FS."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    filename = hashlib.sha1(url.encode("utf-8")).hexdigest() + ".parquet"
+    path = CACHE_DIR / filename
+    tmp_path = CACHE_DIR / (filename + ".tmp")
+
+    if path.exists() and path.stat().st_size > 0:
+        return str(path)
+
+    with requests.get(url, stream=True, timeout=(15, 300)) as response:
+        response.raise_for_status()
+        with open(tmp_path, "wb") as fh:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    fh.write(chunk)
+    tmp_path.replace(path)
+    return str(path)
+
+
 @st.cache_data(show_spinner=True, ttl=60 * 60)
 def load_radios_geoparquet(year: int, provincia_code: str | None, departamento_code: str | None):
     if gpd is None:
@@ -525,24 +637,25 @@ def load_radios_geoparquet(year: int, provincia_code: str | None, departamento_c
         )
 
     url = source_url(year, "radios")
+    local_path = download_remote_parquet(url)
     join_col = JOIN_COL_BY_YEAR[year]
 
     filters = []
     if provincia_code and provincia_code != "__ALL__":
-        filters.append(("PROV", "=", str(provincia_code)))
+        filters.append(("PROV", "=", str(provincia_code).zfill(2)))
     if departamento_code and departamento_code != "__ALL__":
-        filters.append(("DEPTO", "=", str(departamento_code)))
+        filters.append(("DEPTO", "=", str(departamento_code).zfill(3)))
 
-    # Incluimos POB_TOT_P/VIV_TOT_P si existen; si alguna columna falta, geopandas puede fallar y se cae a lectura completa.
     columns = [join_col, "PROV", "DEPTO", "geometry"]
 
     try:
         if filters:
-            gdf = gpd.read_parquet(url, columns=columns, filters=filters)
+            gdf = gpd.read_parquet(local_path, columns=columns, filters=filters)
         else:
-            gdf = gpd.read_parquet(url, columns=columns)
+            gdf = gpd.read_parquet(local_path, columns=columns)
     except Exception:
-        gdf = gpd.read_parquet(url)
+        # Fallback: lectura completa local. No volvemos a pedir el archivo por HTTPS.
+        gdf = gpd.read_parquet(local_path)
 
     join_col_actual = find_column_case_insensitive(gdf.columns, join_col)
     if join_col_actual is None:
@@ -886,10 +999,23 @@ else:
         st.caption(
             "Podés consultar los Parquet remotos directamente. Alias sugeridos: census-data, metadata y radios."
         )
-        default_sql = f"""
+        if variable_selected in RADIOS_NUMERIC_VARIABLES and (categoria_value == "__ALL__"):
+            default_sql = f"""
+SELECT
+    PROV,
+    DEPTO,
+    {JOIN_COL_BY_YEAR[year_selected]} AS id_geo,
+    {variable_selected} AS conteo
+FROM read_parquet('{source_url(year_selected, 'radios')}')
+WHERE {build_where_radios(provincia_code, departamento_code)}
+LIMIT 20
+""".strip()
+        else:
+            default_sql = f"""
 SELECT *
 FROM read_parquet('{source_url(year_selected, 'census')}')
 WHERE codigo_variable = '{variable_selected}'
+  AND {build_where_long(provincia_code=provincia_code, departamento_code=departamento_code, categoria_value=categoria_value)}
 LIMIT 20
 """.strip()
         sql_custom = st.text_area("Consulta DuckDB", value=default_sql, height=180)

@@ -8,3 +8,5 @@ pyogrio>=0.7
 shapely>=2.0
 pydeck>=0.8
 openpyxl>=3.1
+
+requests>=2.31

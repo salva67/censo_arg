@@ -37,16 +37,20 @@ Ejemplos:
 from __future__ import annotations
 
 import argparse
+import hashlib
+import os
 import sys
 from pathlib import Path
 from typing import Iterable
 
 import duckdb
 import pandas as pd
+import requests
 
 
 VALID_YEARS = {1991, 2001, 2010, 2022}
 BASE_URL = "https://data.source.coop/nlebovits/censo-argentino/{year}/{filename}"
+CACHE_DIR = Path(os.getenv("CENSO_CACHE_DIR", "/tmp/censo_argentino_cache"))
 
 FILES = {
     "census": "census-data.parquet",
@@ -342,8 +346,9 @@ def export_geo_layer(
     df = df.rename(columns={"id_geo": join_col})
     df[join_col] = df[join_col].astype(str)
 
-    print("Leyendo radios censales GeoParquet remoto...")
-    gdf = gpd.read_parquet(radios_url)
+    print("Descargando/leyendo radios censales GeoParquet...")
+    radios_local = download_remote_parquet(radios_url)
+    gdf = gpd.read_parquet(radios_local)
 
     if join_col not in gdf.columns:
         die(f"No encontré la columna {join_col} en radios.parquet")
