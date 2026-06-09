@@ -507,6 +507,84 @@ def build_share_chart(df: pd.DataFrame, label_col: str, top_n: int):
     return (bars + labels).properties(height=max(300, min(850, 26 * len(chart_df))))
 
 
+def prepare_levels_by_area(
+    df: pd.DataFrame,
+    group_label: str,
+    year: int,
+    provincia_code: str | None,
+    top_n_areas: int,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Prepara el dataframe área×nivel: agrega `area_label`, `nivel`, % por área y recorta al top N de áreas por total."""
+    if df.empty:
+        return df.assign(area_label=pd.Series(dtype=str), nivel=pd.Series(dtype=str)), []
+
+    out = humanize_area_labels(df, group_label, year, provincia_code)
+    cats = out["etiqueta_categoria"] if "etiqueta_categoria" in out.columns else pd.Series([None] * len(out))
+    vals = out["valor_categoria"] if "valor_categoria" in out.columns else pd.Series([None] * len(out))
+    out["nivel"] = [
+        _clean_text(c) or (f"Categoría {_clean_text(v)}" if _clean_text(v) else "Sin nivel")
+        for c, v in zip(cats, vals)
+    ]
+    out["conteo"] = pd.to_numeric(out["conteo"], errors="coerce").fillna(0)
+
+    totals = out.groupby("area_label")["conteo"].sum().sort_values(ascending=False)
+    area_order = list(totals.head(int(top_n_areas)).index)
+    out = out[out["area_label"].isin(area_order)].copy()
+    out["area_total"] = out["area_label"].map(totals)
+    out["pct_area"] = np.where(out["area_total"] > 0, out["conteo"] / out["area_total"], 0)
+    return out, area_order
+
+
+def build_grouped_bar_chart(
+    df: pd.DataFrame,
+    area_order: list[str],
+    measure_mode: str = "Conteo absoluto",
+    value_col: str = "conteo",
+):
+    """Barras agrupadas: cada área abre una barra por nivel, lado a lado."""
+    value_title, value_fmt, _ = measure_value_meta(measure_mode)
+    height = max(320, min(950, 30 * max(1, len(area_order)) * 1 + 18 * max(1, df["nivel"].nunique())))
+    return (
+        alt.Chart(df)
+        .mark_bar()
+        .encode(
+            y=alt.Y("area_label:N", sort=area_order, title=""),
+            yOffset=alt.YOffset("nivel:N"),
+            x=alt.X(f"{value_col}:Q", title=value_title, axis=alt.Axis(format=value_fmt)),
+            color=alt.Color("nivel:N", title="Nivel", scale=alt.Scale(scheme="tableau10")),
+            tooltip=[
+                alt.Tooltip("area_label:N", title="Área"),
+                alt.Tooltip("nivel:N", title="Nivel"),
+                alt.Tooltip(f"{value_col}:Q", title=value_title, format=value_fmt),
+                alt.Tooltip("pct_area:Q", title="% del área", format=".1%"),
+            ],
+        )
+        .properties(height=int(height))
+    )
+
+
+def build_grouped_share_chart(df: pd.DataFrame, area_order: list[str]):
+    """Barras agrupadas de composición: % de cada nivel dentro de su área."""
+    height = max(320, min(950, 30 * max(1, len(area_order)) + 18 * max(1, df["nivel"].nunique())))
+    return (
+        alt.Chart(df)
+        .mark_bar()
+        .encode(
+            y=alt.Y("area_label:N", sort=area_order, title=""),
+            yOffset=alt.YOffset("nivel:N"),
+            x=alt.X("pct_area:Q", title="% dentro del área", axis=alt.Axis(format="%")),
+            color=alt.Color("nivel:N", title="Nivel", scale=alt.Scale(scheme="tableau10")),
+            tooltip=[
+                alt.Tooltip("area_label:N", title="Área"),
+                alt.Tooltip("nivel:N", title="Nivel"),
+                alt.Tooltip("pct_area:Q", title="% del área", format=".1%"),
+                alt.Tooltip("conteo:Q", title="Valor", format=",.0f"),
+            ],
+        )
+        .properties(height=int(height))
+    )
+
+
 def summarize_result(df: pd.DataFrame, label_col: str | None) -> dict[str, object]:
     enriched = enrich_result(df)
     if enriched.empty or "conteo" not in enriched.columns:
@@ -839,6 +917,53 @@ def query_censo_long(
     GROUP BY {group_by}
     ORDER BY conteo DESC
     {limit_clause}
+    """
+    return run_sql(sql)
+
+
+# Geografía por nivel: columnas usadas para abrir cada área en sus categorías.
+LEVEL_GEO_COLS = {
+    "Provincia": ["valor_provincia", "etiqueta_provincia"],
+    "Departamento": ["valor_provincia", "etiqueta_provincia", "valor_departamento", "etiqueta_departamento"],
+    "Radio censal": ["id_geo"],
+}
+
+
+@st.cache_data(show_spinner=True, ttl=60 * 30)
+def query_censo_levels_by_area(
+    year: int,
+    variable: str,
+    provincia_code: str | None,
+    departamento_code: str | None,
+    group_label: str,
+) -> pd.DataFrame:
+    """Devuelve área + nivel (categoría) + conteo para gráficos agrupados por nivel.
+
+    No aplica filtro de categoría: trae todos los niveles. El recorte de 'top N áreas'
+    se resuelve después en pandas para no cortar niveles a la mitad.
+    """
+    geo_cols = LEVEL_GEO_COLS.get(group_label)
+    if not geo_cols:
+        return pd.DataFrame()
+
+    url = source_url(year, "census")
+    cols = geo_cols + ["valor_categoria", "etiqueta_categoria"]
+    select_cols = ",\n        ".join(cols)
+    group_by = ", ".join(str(i + 1) for i in range(len(cols)))
+    where = build_where_long(
+        variable=variable,
+        provincia_code=provincia_code,
+        departamento_code=departamento_code,
+    )
+    sql = f"""
+    SELECT
+        {select_cols},
+        SUM(conteo) AS conteo
+    FROM read_parquet({sql_quote(url)})
+    WHERE {where}
+      AND valor_categoria IS NOT NULL
+    GROUP BY {group_by}
+    ORDER BY conteo DESC
     """
     return run_sql(sql)
 
@@ -1971,6 +2096,45 @@ else:
             st.info("No encontré una columna de etiqueta para graficar esta consulta.")
         else:
             top_n_chart = st.slider("Top N para gráficos", 5, 50, min(20, max(5, len(df_enriched))), 5)
+
+            # ¿Podemos discriminar por niveles? (variable con categorías, sin nivel filtrado, área geográfica)
+            discriminate = (
+                has_categories
+                and categoria_value == "__ALL__"
+                and group_selected in ("Provincia", "Departamento", "Radio censal")
+            )
+
+            if discriminate:
+                st.markdown("### Discriminado por niveles de la variable")
+                try:
+                    raw_levels = query_censo_levels_by_area(
+                        year_selected, variable_selected, provincia_code, departamento_code, group_selected
+                    )
+                    lvl_df, area_order = prepare_levels_by_area(
+                        raw_levels, group_selected, year_selected, provincia_code, top_n_chart
+                    )
+                    if lvl_df.empty:
+                        st.info("No hay datos por nivel para este recorte; muestro los totales por área más abajo.")
+                    else:
+                        st.markdown(f"**Ranking por área, abierto por nivel** (top {len(area_order)} áreas)")
+                        st.altair_chart(
+                            build_grouped_bar_chart(lvl_df, area_order, measure_mode),
+                            use_container_width=True,
+                        )
+                        st.markdown("**Composición: % de cada nivel dentro del área**")
+                        st.altair_chart(
+                            build_grouped_share_chart(lvl_df, area_order),
+                            use_container_width=True,
+                        )
+                        st.caption(
+                            "Cada área se abre en sus niveles (barras agrupadas). El segundo gráfico normaliza a % "
+                            "dentro de cada área para comparar composición independientemente del tamaño."
+                        )
+                except Exception as exc:
+                    st.warning(f"No pude graficar la apertura por niveles: {exc}")
+                st.divider()
+                st.markdown("### Totales por área (todos los niveles sumados)")
+
             chart_a, chart_b = st.columns(2)
             with chart_a:
                 st.markdown("**Ranking de áreas**")
@@ -1997,15 +2161,10 @@ else:
             "Para evitar tiempos de carga altos, conviene filtrar al menos una provincia y, si es Buenos Aires/CABA, idealmente un departamento/comuna."
         )
 
-        # Qué se está mapeando: variable, nivel (categoría), medición. Visible siempre.
+        # Nivel a mapear: el mapa pinta un valor por radio, así que se elige un nivel (o el total).
+        # Por defecto respeta el nivel elegido en la barra lateral.
+        map_categoria = categoria_value
         nivel_mapa_txt = "Todos los niveles (suma)" if categoria_value == "__ALL__" else selected_cat_label.split(" (")[0]
-        desc_mapa = f" — {variable_label_text}" if variable_label_text else ""
-        st.info(
-            f"🗺️ **Mapeando:** {variable_selected}{desc_mapa}  ·  "
-            f"**Nivel:** {nivel_mapa_txt}  ·  **Medición:** {measure_mode}"
-        )
-        if has_categories and categoria_value == "__ALL__":
-            st.caption("💡 Para mapear un nivel específico (p. ej. solo «Mujer»), elegí la **Categoría** en el panel izquierdo.")
 
         if gpd is None or pdk is None:
             st.warning(
@@ -2022,6 +2181,29 @@ else:
                     "y **Log(valor + 1)** cuando un radio muy grande domina la escala. La escala por **cuantiles** reparte los colores "
                     "de forma más equilibrada cuando hay muchos outliers."
                 )
+
+            # Selector de nivel: permite recolorear el mapa por cada categoría de la variable.
+            if has_categories:
+                nivel_opts = {"Total (todos los niveles)": "__ALL__"}
+                for _, r in categorias.iterrows():
+                    etiqueta = _clean_text(r.get("etiqueta_categoria")) or "Nivel"
+                    nivel_opts[f"{etiqueta} ({r.get('valor_categoria')})"] = str(r["valor_categoria"])
+                nivel_keys = list(nivel_opts.keys())
+                default_idx = next((i for i, v in enumerate(nivel_opts.values()) if v == categoria_value), 0)
+                map_nivel_label = st.selectbox(
+                    "Nivel a mapear",
+                    nivel_keys,
+                    index=default_idx,
+                    help="El mapa pinta un valor por radio. Elegí qué nivel de la variable ver; «Total» suma todos los niveles.",
+                )
+                map_categoria = nivel_opts[map_nivel_label]
+                nivel_mapa_txt = "Todos los niveles (suma)" if map_categoria == "__ALL__" else map_nivel_label.split(" (")[0]
+
+            desc_mapa = f" — {variable_label_text}" if variable_label_text else ""
+            st.info(
+                f"🗺️ **Mapeando:** {variable_selected}{desc_mapa}  ·  "
+                f"**Nivel:** {nivel_mapa_txt}  ·  **Medición:** {measure_mode}"
+            )
 
             st.markdown("**Mapa base y contexto**")
             base1, base2, base3, base4 = st.columns(4)
@@ -2136,7 +2318,7 @@ else:
                             variable_selected,
                             provincia_code,
                             departamento_code,
-                            categoria_value,
+                            map_categoria,
                             measure_mode,
                         )
                         if radio_counts.empty:
@@ -2205,7 +2387,7 @@ else:
                             base_map_style=base_map_style,
                             map_height=map_height,
                             variable_label=f"{variable_selected} — {variable_label_text}" if variable_label_text else variable_selected,
-                            nivel_label="" if categoria_value == "__ALL__" else nivel_mapa_txt,
+                            nivel_label="" if map_categoria == "__ALL__" else nivel_mapa_txt,
                         )
                         st.pydeck_chart(deck, use_container_width=True)
 
