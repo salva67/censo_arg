@@ -337,6 +337,80 @@ def enrich_result(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _clean_text(value: object) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    return "" if text.lower() in {"", "nan", "none", "<na>"} else text
+
+
+def humanize_area_labels(
+    df: pd.DataFrame,
+    group_label: str,
+    year: int,
+    provincia_code: str | None,
+) -> pd.DataFrame:
+    """Crea una columna `area_label` legible: 'Nombre (código)' en vez de un código pelado.
+
+    Resuelve nombres faltantes o numéricos cruzando con los catálogos de provincias y
+    departamentos (GeoRef + fallback local). Para 'Radio censal' y 'Categoría' arma una
+    etiqueta clara sin inventar nombres.
+    """
+    out = df.copy()
+    if out.empty:
+        out["area_label"] = pd.Series(dtype=str)
+        return out
+
+    if group_label == "Radio censal" and "id_geo" in out.columns:
+        out["area_label"] = out["id_geo"].map(_clean_text)
+        return out
+
+    if group_label == "Categoría":
+        cats = out["etiqueta_categoria"] if "etiqueta_categoria" in out.columns else pd.Series([None] * len(out))
+        vals = out["valor_categoria"] if "valor_categoria" in out.columns else pd.Series([None] * len(out))
+        labels = []
+        for name_raw, code_raw in zip(cats, vals):
+            name, code = _clean_text(name_raw), _clean_text(code_raw)
+            labels.append(name or (f"Categoría {code}" if code else "Sin categoría"))
+        out["area_label"] = labels
+        return out
+
+    if group_label == "Provincia" and "valor_provincia" in out.columns:
+        prov_df = get_provincias(year)
+        prov_names = dict(zip(prov_df["valor_provincia"].astype(str), prov_df["etiqueta_provincia"]))
+        labels = []
+        for _, row in out.iterrows():
+            code = _clean_text(row.get("valor_provincia")).zfill(2)
+            name = _clean_text(row.get("etiqueta_provincia"))
+            if not name or name.isdigit():
+                name = _clean_text(prov_names.get(code)) or PROVINCE_NAMES.get(code, f"Provincia {code}")
+            labels.append(f"{name} ({code})")
+        out["area_label"] = labels
+        return out
+
+    if group_label == "Departamento" and "valor_departamento" in out.columns:
+        dept_names: dict[str, str] = {}
+        if provincia_code and provincia_code != "__ALL__":
+            dd = get_departamentos(year, provincia_code)
+            if not dd.empty:
+                dept_names = dict(
+                    zip(dd["valor_departamento"].astype(str).str.zfill(3), dd["etiqueta_departamento"])
+                )
+        labels = []
+        for _, row in out.iterrows():
+            code = _clean_text(row.get("valor_departamento")).zfill(3)
+            name = _clean_text(row.get("etiqueta_departamento"))
+            if not name or name.isdigit():
+                name = _clean_text(dept_names.get(code)) or f"Departamento {code}"
+            labels.append(f"{name} ({code})")
+        out["area_label"] = labels
+        return out
+
+    fallback_col = get_label_column(out)
+    out["area_label"] = out[fallback_col].map(_clean_text) if fallback_col else ""
+    return out
+
+
 def measure_value_meta(measure_mode: str) -> tuple[str, str, str]:
     """Título de eje, formato Altair y esquema de color según el modo de medición.
 
@@ -701,6 +775,31 @@ def get_categorias(year: int, variable: str | None) -> pd.DataFrame:
     ORDER BY valor_categoria, etiqueta_categoria
     """
     return run_sql(sql)
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60)
+def get_variable_label(year: int, variable: str | None) -> str:
+    """Descripción legible de la variable (etiqueta_variable de metadata.parquet)."""
+    if not variable:
+        return ""
+    if variable in RADIOS_NUMERIC_VARIABLES:
+        return RADIOS_NUMERIC_VARIABLES[variable]
+
+    url = source_url(year, "metadata")
+    try:
+        df = run_sql(
+            f"""
+            SELECT any_value(etiqueta_variable) AS etiqueta
+            FROM read_parquet({sql_quote(url)})
+            WHERE codigo_variable = {sql_quote(variable)}
+            """
+        )
+    except Exception:
+        return ""
+    if df.empty:
+        return ""
+    value = df.iloc[0].get("etiqueta")
+    return "" if pd.isna(value) else str(value).strip()
 
 
 # -----------------------------------------------------------------------------
@@ -1708,11 +1807,18 @@ with st.sidebar:
     limit_rows = st.slider("Máximo de filas", min_value=10, max_value=5000, value=500, step=10)
 
 
+variable_label_text = get_variable_label(year_selected, variable_selected)
+
 col_a, col_b, col_c, col_d = st.columns(4)
 col_a.metric("Año", str(year_selected))
-col_b.metric("Variable", variable_selected)
+col_b.metric("Variable", variable_selected, help=variable_label_text or "Sin descripción en metadata.parquet")
 col_c.metric("Provincia", "Todas" if provincia_code == "__ALL__" else selected_prov_label.split(" (")[0])
 col_d.metric("Medición", measure_mode)
+
+if variable_label_text:
+    st.caption(f"📋 **{variable_selected}** — {variable_label_text}")
+else:
+    st.caption(f"📋 **{variable_selected}** — sin descripción en metadata.parquet para este año.")
 
 try:
     df_result, query_source = query_censo_resilient(
@@ -1754,7 +1860,9 @@ if df_result.empty:
         st.caption(f"No pude generar diagnóstico automático: {exc}")
 else:
     df_enriched = enrich_result(df_result)
-    label_col = get_label_column(df_enriched)
+    # Etiquetas legibles ("Nombre (código)") en lugar de códigos pelados como "497".
+    df_enriched = humanize_area_labels(df_enriched, group_selected, year_selected, provincia_code)
+    label_col = "area_label" if "area_label" in df_enriched.columns else get_label_column(df_enriched)
     summary = summarize_result(df_enriched, label_col)
 
     col_total, col_source = st.columns([1, 2])
